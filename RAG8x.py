@@ -1,10 +1,10 @@
+```python
 import os
 import pandas as pd
 import PyPDF2
 import openai
 import gdown
 import tempfile
-import requests
 import numpy as np
 import logging
 from io import BytesIO
@@ -18,12 +18,13 @@ from pydantic import BaseModel
 import hashlib
 import pickle
 import time
+import concurrent.futures
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# API-Key und Neo4j-Konfiguration (hier aus Umgebungsvariablen oder Secrets laden)
+# API-Key und Neo4j-Konfiguration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
@@ -43,7 +44,7 @@ app = FastAPI()
 # CORS für CodePen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Für Produktion spezifische Origins wie "https://codepen.io" setzen
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,7 +57,7 @@ embedding_cache: Dict[str, np.ndarray] = {}
 chunk_embeddings: List[Tuple[str, np.ndarray]] = []
 documents: List[str] = []
 
-# Funktionen aus deinem Code (unverändert)
+# Funktionen aus deinem ursprünglichen Code
 def verify_neo4j_connection() -> bool:
     try:
         with driver.session() as session:
@@ -149,7 +150,6 @@ def create_embeddings_parallel(documents: List[str], max_length: int = 300) -> L
     if not chunks:
         logger.warning("⚠️ Keine Chunks zum Verarbeiten")
         return []
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         future_to_chunk = {executor.submit(get_embedding, chunk): chunk for chunk in chunks}
         for future in concurrent.futures.as_completed(future_to_chunk):
