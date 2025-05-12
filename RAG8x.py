@@ -18,6 +18,7 @@ import hashlib
 import pickle
 import time
 import concurrent.futures
+import threading
 
 # Logging konfigurieren
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,6 +56,7 @@ EMBEDDING_CACHE_FILE = os.path.join(DOWNLOAD_PATH, "embedding_cache.pkl")
 embedding_cache: Dict[str, np.ndarray] = {}
 chunk_embeddings: List[Tuple[str, np.ndarray]] = []
 documents: List[str] = []
+cache_lock = threading.Lock()  # Lock für Thread-Sicherheit
 
 # Funktionen aus deinem ursprünglichen Code
 def verify_neo4j_connection() -> bool:
@@ -78,12 +80,13 @@ def load_embedding_cache() -> None:
             logger.warning(f"❌ Fehler beim Laden des Embedding-Cache: {e}")
 
 def save_embedding_cache() -> None:
-    try:
-        with open(EMBEDDING_CACHE_FILE, 'wb') as f:
-            pickle.dump(embedding_cache, f)
-        logger.info("✅ Embedding-Cache gespeichert")
-    except Exception as e:
-        logger.warning(f"❌ Fehler beim Speichern des Embedding-Cache: {e}")
+    with cache_lock:  # Thread-Sicheres Speichern
+        try:
+            with open(EMBEDDING_CACHE_FILE, 'wb') as f:
+                pickle.dump(embedding_cache, f)
+            logger.info("✅ Embedding-Cache gespeichert")
+        except Exception as e:
+            logger.warning(f"❌ Fehler beim Speichern des Embedding-Cache: {e}")
 
 def download_drive_folder(output_path: str) -> None:
     try:
@@ -149,13 +152,14 @@ def split_text(text: str, max_length: int = 300) -> List[str]:
 
 def get_embedding(text: str, model: str = "text-embedding-3-small") -> np.ndarray:
     text_hash = hashlib.md5(text.encode()).hexdigest()
-    if text_hash in embedding_cache:
-        return embedding_cache[text_hash]
+    with cache_lock:  # Thread-Sicherer Zugriff auf Cache
+        if text_hash in embedding_cache:
+            return embedding_cache[text_hash]
     try:
         response = client.embeddings.create(model=model, input=[text])
         embedding = np.array(response.data[0].embedding)
-        embedding_cache[text_hash] = embedding
-        save_embedding_cache()
+        with cache_lock:  # Thread-Sicheres Schreiben
+            embedding_cache[text_hash] = embedding
         return embedding
     except openai.OpenAIError as e:
         logger.error(f"❌ OpenAI Embedding-Fehler: {e}")
@@ -177,6 +181,7 @@ def create_embeddings_parallel(documents: List[str], max_length: int = 300) -> L
                     chunk_embeddings.append((chunk, embedding))
             except Exception as e:
                 logger.error(f"❌ Fehler bei Embedding für Chunk: {e}")
+    save_embedding_cache()  # Speichern nach Abschluss aller Threads
     return chunk_embeddings
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -194,7 +199,7 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         query_emb = get_embedding(query)
         if np.all(query_emb == 0):
             logger.warning("⚠️ Ungültiges Query-Embedding")
-            return "Keine relevanten Dokumente gemacht."
+            return "Keine relevanten Dokumente gefunden."
         similarities = [(chunk, cosine_similarity(query_emb, emb)) for chunk, emb in chunk_embeddings]
         similarities.sort(key=lambda x: x[1], reverse=True)
         top_chunks = [chunk for chunk, _ in similarities[:top_n] if chunk]
@@ -203,7 +208,7 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         if estimate_tokens(context) > max_tokens:
             context = context[:max(1, int(len(context) * max_tokens / estimate_tokens(context)))]
             logger.warning("⚠️ Dokumenten-Kontext gekürzt")
-        return context if context else "Keine relevanten Dokumente gemacht."
+        return context if context else "Keine relevanten Dokumente gefunden."
     except Exception as e:
         logger.error(f"❌ Fehler bei der Dokumentensuche: {e}")
         return "Fehler bei der Dokumentensuche."
@@ -262,7 +267,7 @@ def get_neo4j_context(user_query: str, limit: int = 100) -> str:
                 context_lines = context_lines[:max(1, int(len(context_lines) * max_tokens / estimate_tokens(context)))]
                 context = "\n".join(context_lines)
                 logger.warning("⚠️ Neo4j-Kontext gekürzt")
-            return context or "Keine relevanten Daten in Neo4j gemacht."
+            return context or "Keine relevanten Daten in Neo4j gefunden."
         except Exception as e:
             logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
             return "Fehler beim Laden der Neo4j-Daten."
