@@ -94,7 +94,7 @@ def download_drive_folder(output_path: str) -> None:
         logger.error(f"❌ Fehler beim Herunterladen des Google Drive-Ordners: {e}")
         raise
 
-def read_folder_data(folder_path: str) -> List[str]:
+def read_folder_data(folder_path: str, password: str = None) -> List[str]:
     files_data = []
     for file_name in os.listdir(folder_path):
         file_path = os.path.join(folder_path, file_name)
@@ -103,12 +103,21 @@ def read_folder_data(folder_path: str) -> List[str]:
                 pdf_text = []
                 with open(file_path, "rb") as pdf_file:
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    if pdf_reader.is_encrypted:
+                        logger.info(f"🔒 PDF {file_name} ist verschlüsselt")
+                        if password:
+                            pdf_reader.decrypt(password)
+                        else:
+                            logger.warning(f"⚠️ Kein Passwort für verschlüsselte PDF {file_name} angegeben")
+                            continue
                     for page in pdf_reader.pages:
                         text = page.extract_text()
                         if text:
                             pdf_text.append(text)
                 if pdf_text:
                     files_data.append(" ".join(pdf_text))
+                else:
+                    logger.warning(f"⚠️ Kein Text in PDF {file_name} extrahiert")
             except Exception as e:
                 logger.error(f"❌ Fehler beim Lesen der PDF {file_name}: {e}")
     return files_data
@@ -292,17 +301,24 @@ class Query(BaseModel):
 async def startup_event():
     global documents, chunk_embeddings
     if not verify_neo4j_connection():
-        raise HTTPException(status_code=500, detail="Neo4j-Verbindung fehlgeschlagen")
+        logger.error("❌ Neo4j-Verbindung fehlgeschlagen, API startet trotzdem")
+        # raise HTTPException(status_code=500, detail="Neo4j-Verbindung fehlgeschlagen")
     load_embedding_cache()
-    download_drive_folder(DOWNLOAD_PATH)
-    documents = read_folder_data(DOWNLOAD_PATH)
-    if not documents:
-        logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden")
-        raise HTTPException(status_code=500, detail="Keine gültigen PDF-Dokumente gefunden")
-    chunk_embeddings = create_embeddings_parallel(documents, max_length=300)
-    if not chunk_embeddings:
-        logger.warning("⚠️ Keine Embeddings erstellt")
-        raise HTTPException(status_code=500, detail="Keine Embeddings erstellt")
+    try:
+        download_drive_folder(DOWNLOAD_PATH)
+        # Passe hier das Passwort an, falls die PDF passwortgeschützt ist
+        documents = read_folder_data(DOWNLOAD_PATH, password=None)  # Setze password="dein-passwort" falls nötig
+        if not documents:
+            logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden, API startet ohne Dokumenten-Kontext")
+            # raise HTTPException(status_code=500, detail="Keine gültigen PDF-Dokumente gefunden")
+        else:
+            chunk_embeddings = create_embeddings_parallel(documents, max_length=300)
+            if not chunk_embeddings:
+                logger.warning("⚠️ Keine Embeddings erstellt, API startet ohne Dokumenten-Kontext")
+                # raise HTTPException(status_code=500, detail="Keine Embeddings erstellt")
+    except Exception as e:
+        logger.error(f"❌ Fehler beim Laden der Dokumente: {e}")
+        # API startet trotzdem, um Neo4j-basierte Anfragen zu ermöglichen
 
 # API-Endpunkt
 @app.post("/analyze")
