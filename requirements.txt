@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+gdown
+PyPDF2
+openai
+neo4j
+numpy
+pandas
