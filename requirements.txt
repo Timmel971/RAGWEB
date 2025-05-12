@@ -6,3 +6,4 @@ openai
 neo4j
 numpy
 pandas
+pycryptodome
