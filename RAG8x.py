@@ -94,7 +94,7 @@ def download_drive_folder(output_path: str) -> None:
         logger.error(f"❌ Fehler beim Herunterladen des Google Drive-Ordners: {e}")
         raise
 
-def read_folder_data(folder_path: str, password: str = None) -> List[str]:
+def read_folder_data(folder_path: str, password: str = "") -> List[str]:
     files_data = []
     for file_name in os.listdir(folder_path):
         file_path = os.path.join(folder_path, file_name)
@@ -307,7 +307,7 @@ async def startup_event():
     try:
         download_drive_folder(DOWNLOAD_PATH)
         # Passe hier das Passwort an, falls die PDF passwortgeschützt ist
-        documents = read_folder_data(DOWNLOAD_PATH, password=None)  # Setze password="dein-passwort" falls nötig
+        documents = read_folder_data(DOWNLOAD_PATH, password="")  # Setze password="dein-passwort" falls nötig
         if not documents:
             logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden, API startet ohne Dokumenten-Kontext")
             # raise HTTPException(status_code=500, detail="Keine gültigen PDF-Dokumente gefunden")
