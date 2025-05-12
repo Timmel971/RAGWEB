@@ -229,7 +229,7 @@ def get_neo4j_context(user_query: str, limit: int = 100) -> str:
             if "siemens" in query_lower or "tass" in query_lower:
                 company_filter = "WHERE p.name CONTAINS 'Siemens' OR c.name CONTAINS 'TASS'"
             result_companies = session.run(f"""
-                MATCH (p:ParentCompany)-[r2:HAS_PARTICIPATION|HAS_ACQUISITION]->(c:Company)
+                MATCH (p:ParentCompany)-[r2:HAS_PARTICIPATION]->(c:Company)
                 {company_filter}
                 RETURN p, r2, c
                 LIMIT $limit
