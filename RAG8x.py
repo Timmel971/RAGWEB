@@ -105,21 +105,30 @@ def read_folder_data(folder_path: str, password: str = "") -> List[str]:
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
                     if pdf_reader.is_encrypted:
                         logger.info(f"🔒 PDF {file_name} ist verschlüsselt")
-                        if password:
+                        try:
                             pdf_reader.decrypt(password)
-                        else:
-                            logger.warning(f"⚠️ Kein Passwort für verschlüsselte PDF {file_name} angegeben")
+                            logger.info(f"✅ PDF {file_name} erfolgreich mit Passwort entschlüsselt")
+                        except Exception as e:
+                            logger.error(f"❌ Fehler beim Entschlüsseln der PDF {file_name}: {str(e)}")
                             continue
+                    else:
+                        logger.info(f"✅ PDF {file_name} ist nicht verschlüsselt")
                     for page in pdf_reader.pages:
                         text = page.extract_text()
                         if text:
                             pdf_text.append(text)
                 if pdf_text:
                     files_data.append(" ".join(pdf_text))
+                    logger.info(f"📄 Text aus PDF {file_name} erfolgreich extrahiert")
                 else:
                     logger.warning(f"⚠️ Kein Text in PDF {file_name} extrahiert")
             except Exception as e:
-                logger.error(f"❌ Fehler beim Lesen der PDF {file_name}: {e}")
+                logger.error(f"❌ Fehler beim Lesen der PDF {file_name}: {str(e)}")
+                continue
+    if not files_data:
+        logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden")
+    else:
+        logger.info(f"🎉 {len(files_data)} PDF-Dokumente erfolgreich verarbeitet")
     return files_data
 
 def split_text(text: str, max_length: int = 300) -> List[str]:
@@ -185,7 +194,7 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         query_emb = get_embedding(query)
         if np.all(query_emb == 0):
             logger.warning("⚠️ Ungültiges Query-Embedding")
-            return "Keine relevanten Dokumente gefunden."
+            return "Keine relevanten Dokumente gemacht."
         similarities = [(chunk, cosine_similarity(query_emb, emb)) for chunk, emb in chunk_embeddings]
         similarities.sort(key=lambda x: x[1], reverse=True)
         top_chunks = [chunk for chunk, _ in similarities[:top_n] if chunk]
@@ -194,7 +203,7 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         if estimate_tokens(context) > max_tokens:
             context = context[:max(1, int(len(context) * max_tokens / estimate_tokens(context)))]
             logger.warning("⚠️ Dokumenten-Kontext gekürzt")
-        return context if context else "Keine relevanten Dokumente gefunden."
+        return context if context else "Keine relevanten Dokumente gemacht."
     except Exception as e:
         logger.error(f"❌ Fehler bei der Dokumentensuche: {e}")
         return "Fehler bei der Dokumentensuche."
@@ -253,7 +262,7 @@ def get_neo4j_context(user_query: str, limit: int = 100) -> str:
                 context_lines = context_lines[:max(1, int(len(context_lines) * max_tokens / estimate_tokens(context)))]
                 context = "\n".join(context_lines)
                 logger.warning("⚠️ Neo4j-Kontext gekürzt")
-            return context or "Keine relevanten Daten in Neo4j gefunden."
+            return context or "Keine relevanten Daten in Neo4j gemacht."
         except Exception as e:
             logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
             return "Fehler beim Laden der Neo4j-Daten."
@@ -307,7 +316,7 @@ async def startup_event():
     try:
         download_drive_folder(DOWNLOAD_PATH)
         # Passe hier das Passwort an, falls die PDF passwortgeschützt ist
-        documents = read_folder_data(DOWNLOAD_PATH, password="")  # Setze password="dein-passwort" falls nötig
+        documents = read_folder_data(DOWNLOAD_PATH, password="")  # Leeres Passwort
         if not documents:
             logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden, API startet ohne Dokumenten-Kontext")
             # raise HTTPException(status_code=500, detail="Keine gültigen PDF-Dokumente gefunden")
