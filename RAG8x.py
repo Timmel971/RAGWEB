@@ -56,9 +56,9 @@ EMBEDDING_CACHE_FILE = os.path.join(DOWNLOAD_PATH, "embedding_cache.pkl")
 embedding_cache: Dict[str, np.ndarray] = {}
 chunk_embeddings: List[Tuple[str, np.ndarray]] = []
 documents: List[str] = []
-cache_lock = threading.Lock()  # Lock für Thread-Sicherheit
+cache_lock = threading.Lock()
 
-# Funktionen aus deinem ursprünglichen Code
+# Funktionen
 def verify_neo4j_connection() -> bool:
     try:
         with driver.session() as session:
@@ -80,7 +80,7 @@ def load_embedding_cache() -> None:
             logger.warning(f"❌ Fehler beim Laden des Embedding-Cache: {e}")
 
 def save_embedding_cache() -> None:
-    with cache_lock:  # Thread-Sicheres Speichern
+    with cache_lock:
         try:
             with open(EMBEDDING_CACHE_FILE, 'wb') as f:
                 pickle.dump(embedding_cache, f)
@@ -152,13 +152,13 @@ def split_text(text: str, max_length: int = 300) -> List[str]:
 
 def get_embedding(text: str, model: str = "text-embedding-3-small") -> np.ndarray:
     text_hash = hashlib.md5(text.encode()).hexdigest()
-    with cache_lock:  # Thread-Sicherer Zugriff auf Cache
+    with cache_lock:
         if text_hash in embedding_cache:
             return embedding_cache[text_hash]
     try:
         response = client.embeddings.create(model=model, input=[text])
         embedding = np.array(response.data[0].embedding)
-        with cache_lock:  # Thread-Sicheres Schreiben
+        with cache_lock:
             embedding_cache[text_hash] = embedding
         return embedding
     except openai.OpenAIError as e:
@@ -181,7 +181,7 @@ def create_embeddings_parallel(documents: List[str], max_length: int = 300) -> L
                     chunk_embeddings.append((chunk, embedding))
             except Exception as e:
                 logger.error(f"❌ Fehler bei Embedding für Chunk: {e}")
-    save_embedding_cache()  # Speichern nach Abschluss aller Threads
+    save_embedding_cache()
     return chunk_embeddings
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -194,7 +194,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 def estimate_tokens(text: str) -> int:
     return len(text) // 4 + 1
 
-def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.ndarray]], top_n: int = 2) -> str:
+def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.ndarray]], top_n: int = 5) -> str:
     try:
         query_emb = get_embedding(query)
         if np.all(query_emb == 0):
@@ -213,64 +213,72 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         logger.error(f"❌ Fehler bei der Dokumentensuche: {e}")
         return "Fehler bei der Dokumentensuche."
 
-def get_neo4j_context(user_query: str, limit: int = 100) -> str:
-    with driver.session() as session:
-        try:
-            context_lines = []
-            max_tokens = 8000
-            result_metrics = session.run("""
-                MATCH (m:FinancialMetric)-[r1]-(n)
-                WHERE m.value IS NOT NULL AND m.year IS NOT NULL
-                RETURN m, r1, n
-                LIMIT $limit
-            """, limit=limit//2)
-            query_lower = user_query.lower()
-            company_filter = ""
-            if "siemens" in query_lower or "tass" in query_lower:
-                company_filter = "WHERE p.name CONTAINS 'Siemens' OR c.name CONTAINS 'TASS'"
-            result_companies = session.run(f"""
-                MATCH (p:ParentCompany)-[r2:HAS_PARTICIPATION]->(c:Company)
-                {company_filter}
-                RETURN p, r2, c
-                LIMIT $limit
-            """, limit=limit//2)
+def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> str:
+    for attempt in range(retries):
+        with driver.session() as session:
+            try:
+                context_lines = []
+                max_tokens = 8000
+                result_metrics = session.run("""
+                    MATCH (m:FinancialMetric)-[r1]-(n)
+                    WHERE m.value IS NOT NULL AND m.year IS NOT NULL
+                    RETURN m, r1, n
+                    LIMIT $limit
+                """, limit=limit//2)
+                query_lower = user_query.lower()
+                company_filter = ""
+                if "siemens" in query_lower or "tass" in query_lower:
+                    company_filter = "WHERE p.name CONTAINS 'Siemens' OR c.name CONTAINS 'TASS'"
+                result_companies = session.run(f"""
+                    MATCH (p:ParentCompany)-[r2:HAS_PARTICIPATION]->(c:Company)
+                    {company_filter}
+                    RETURN p, r2, c
+                    LIMIT $limit
+                """, limit=limit//2)
 
-            def describe_node(node):
-                if node is None:
-                    return "None"
-                label = list(node.labels)[0] if node.labels else "Node"
-                name = node.get("name") or node.get("id") or label
-                props = ", ".join([f"{k}: {v}" for k, v in node.items() if k not in ["name", "id"] and v is not None])
-                return f"{label}({name}) [{props}]" if props else f"{label}({name})"
+                def describe_node(node):
+                    if node is None:
+                        return "None"
+                    label = list(node.labels)[0] if node.labels else "Node"
+                    name = node.get("name") or node.get("id") or label
+                    props = ", ".join([f"{k}: {v}" for k, v in node.items() if k not in ["name", "id"] and v is not None])
+                    return f"{label}({name}) [{props}]" if props else f"{label}({name})"
 
-            for record in result_metrics:
-                m = record["m"]
-                n = record["n"]
-                r1 = record["r1"]
-                m_desc = describe_node(m)
-                n_desc = describe_node(n)
-                line = f"{m_desc} -[:{r1.type}]- {n_desc}"
-                context_lines.append(line)
+                for record in result_metrics:
+                    m = record["m"]
+                    n = record["n"]
+                    r1 = record["r1"]
+                    m_desc = describe_node(m)
+                    n_desc = describe_node(n)
+                    line = f"{m_desc} -[:{r1.type}]- {n_desc}"
+                    context_lines.append(line)
 
-            for record in result_companies:
-                p = record["p"]
-                c = record["c"]
-                r2 = record["r2"]
-                p_desc = describe_node(p)
-                c_desc = describe_node(c)
-                props = ", ".join([f"{k}: {v}" for k, v in r2.items() if v is not None])
-                line = f"{p_desc} -[:{r2.type} {props}]- {c_desc}"
-                context_lines.append(line)
+                for record in result_companies:
+                    p = record["p"]
+                    c = record["c"]
+                    r2 = record["r2"]
+                    p_desc = describe_node(p)
+                    c_desc = describe_node(c)
+                    props = ", ".join([f"{k}: {v}" for k, v in r2.items() if v is not None])
+                    line = f"{p_desc} -[:{r2.type} {props}]- {c_desc}"
+                    context_lines.append(line)
 
-            context = "\n".join(context_lines)
-            if estimate_tokens(context) > max_tokens:
-                context_lines = context_lines[:max(1, int(len(context_lines) * max_tokens / estimate_tokens(context)))]
                 context = "\n".join(context_lines)
-                logger.warning("⚠️ Neo4j-Kontext gekürzt")
-            return context or "Keine relevanten Daten in Neo4j gefunden."
-        except Exception as e:
-            logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
-            return "Fehler beim Laden der Neo4j-Daten."
+                if estimate_tokens(context) > max_tokens:
+                    context_lines = context_lines[:max(1, int(len(context_lines) * max_tokens / estimate_tokens(context)))]
+                    context = "\n".join(context_lines)
+                    logger.warning("⚠️ Neo4j-Kontext gekürzt")
+                return context or "Keine relevanten Daten in Neo4j gefunden."
+            except ServiceUnavailable as e:
+                logger.error(f"❌ Neo4j-Verbindungsfehler (Versuch {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)  # Exponentielles Backoff
+                    continue
+                logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
+                return "Fehler beim Laden der Neo4j-Daten."
+            except Exception as e:
+                logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
+                return "Fehler beim Laden der Neo4j-Daten."
 
 def generate_response(context: str, user_query: str) -> str:
     if not context.strip():
@@ -286,7 +294,7 @@ def generate_response(context: str, user_query: str) -> str:
                 "Du bist ein präziser Assistent für Siemens-Konzern-Analysen. "
                 "Antworte ausschließlich auf Basis der bereitgestellten Daten. "
                 "Nutze keine externen Quellen oder Vorwissen. "
-                "Wenn die Frage nach Anteilsverhältnissen oder Übernahmen fragt, suche nach Beziehungen wie HAS_PARTICIPATION oder HAS_ACQUISITION und gib den sharePercentage an. "
+                "Wenn die Frage nach Anteilsverhältnissen oder Übernahmen fragt, suche nach Beziehungen wie HAS_PARTICIPATION und gib den sharePercentage an. "
                 "Falls keine passenden Informationen im Kontext vorhanden sind, antworte mit 'Keine ausreichenden Daten gefunden'. "
                 "Antworte klar, präzise und in deutscher Sprache."
             )
@@ -316,30 +324,25 @@ async def startup_event():
     global documents, chunk_embeddings
     if not verify_neo4j_connection():
         logger.error("❌ Neo4j-Verbindung fehlgeschlagen, API startet trotzdem")
-        # raise HTTPException(status_code=500, detail="Neo4j-Verbindung fehlgeschlagen")
     load_embedding_cache()
     try:
         download_drive_folder(DOWNLOAD_PATH)
-        # Passe hier das Passwort an, falls die PDF passwortgeschützt ist
-        documents = read_folder_data(DOWNLOAD_PATH, password="")  # Leeres Passwort
+        documents = read_folder_data(DOWNLOAD_PATH, password="")
         if not documents:
             logger.warning("⚠️ Keine gültigen PDF-Dokumente gefunden, API startet ohne Dokumenten-Kontext")
-            # raise HTTPException(status_code=500, detail="Keine gültigen PDF-Dokumente gefunden")
         else:
             chunk_embeddings = create_embeddings_parallel(documents, max_length=300)
             if not chunk_embeddings:
                 logger.warning("⚠️ Keine Embeddings erstellt, API startet ohne Dokumenten-Kontext")
-                # raise HTTPException(status_code=500, detail="Keine Embeddings erstellt")
     except Exception as e:
         logger.error(f"❌ Fehler beim Laden der Dokumente: {e}")
-        # API startet trotzdem, um Neo4j-basierte Anfragen zu ermöglichen
 
 # API-Endpunkt
 @app.post("/analyze")
 async def analyze(query: Query):
     try:
         graph_context = get_neo4j_context(query.question, limit=100)
-        document_context = retrieve_relevant_chunks(query.question, chunk_embeddings, top_n=2)
+        document_context = retrieve_relevant_chunks(query.question, chunk_embeddings, top_n=5)
         combined_context = f"Neo4j-Daten:\n{graph_context}\n\nGeschäftsberichte:\n{document_context}"
         answer = generate_response(combined_context, query.question)
         return {"answer": answer}
