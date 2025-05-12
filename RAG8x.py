@@ -238,7 +238,7 @@ def get_neo4j_context(user_query: str, limit: int = 100) -> str:
                 c_desc = describe_node(c)
                 props = ", ".join([f"{k}: {v}" for k, v in r2.items() if v is not None])
                 line = f"{p_desc} -[:{r2.type} {props}]- {c_desc}"
-                context Lines.append(line)
+                context_lines.append(line)
 
             context = "\n".join(context_lines)
             if estimate_tokens(context) > max_tokens:
