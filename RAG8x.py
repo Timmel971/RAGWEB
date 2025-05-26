@@ -53,7 +53,7 @@ except Exception as e:
     logger.error(f"❌ Fehler beim Initialisieren des Neo4j-Treibers: {e}")
     raise
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # FastAPI-App
 app = FastAPI()
@@ -234,7 +234,9 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         return "Fehler bei der Dokumentensuche."
 
 def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> List[Dict]:
-    # Extrahiere Suchbegriff und Jahr aus der Abfrage
+    """
+    Ruft Kontextdaten aus der Neo4j-Datenbank ab, die in toProps-Feldern von Beziehungen enthalten sind.
+    """
     keywords = user_query.lower().split()
     year = None
     for word in keywords:
@@ -249,42 +251,41 @@ def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> Li
             with driver.session() as session:
                 context = []
                 max_tokens = 8000
-                result = session.run("""
-                    MATCH (fm:FinancialMetric)-[:HAS_FINANCIAL_METRIC]->(entity)
-                    WHERE (entity:ParentCompany OR entity:Company)
-                    AND fm.value IS NOT NULL AND fm.year IS NOT NULL
-                    AND toLower(fm.name) CONTAINS $search_term
-                    AND ($year IS NULL OR fm.year = $year)
-                    RETURN fm.name AS name, fm.year AS year, fm.value AS value, fm.unit AS unit,
-                           fm.category AS category, entity.name AS entity_name
+
+                # Abfrage für finanzielle Daten in toProps-Feldern von Beziehungen
+                query = """
+                    MATCH (pc:ParentCompany {name: "Siemens-Konzern"})-[r]->(t)
+                    WHERE EXISTS(r.toProps)
+                    AND ($year IS NULL OR r.toProps.year = $year)
+                    AND (toLower(r.toProps.name) CONTAINS $search_term OR toLower(r.toProps.category) CONTAINS $search_term)
+                    RETURN r.toProps AS financial_data, t
                     LIMIT $limit
-                """, {
+                """
+                result = session.run(query, {
                     "search_term": search_term,
                     "year": year,
                     "limit": limit
                 })
 
                 for record in result:
-                    # Überprüfe, ob alle erforderlichen Felder vorhanden sind
-                    if (record["name"] is None or record["year"] is None or
-                        record["value"] is None or record["unit"] is None or
-                        record["entity_name"] is None):
-                        logger.warning(f"⚠️ Unvollständige Daten in Neo4j: {dict(record)}")
-                        continue  # Überspringe unvollständige Datensätze
-                    context.append({
-                        "name": str(record["name"]),
-                        "year": record["year"],
-                        "value": record["value"],
-                        "unit": str(record["unit"]),
-                        "category": str(record["category"]) if record["category"] else None,
-                        "entity_name": str(record["entity_name"])
-                    })
+                    financial_data = record["financial_data"]
+                    if financial_data and "name" in financial_data and "value" in financial_data:
+                        entry = {
+                            "name": str(financial_data["name"]),
+                            "year": financial_data["year"] if "year" in financial_data else None,
+                            "value": financial_data["value"],
+                            "unit": str(financial_data["unit"]) if "unit" in financial_data else None,
+                            "category": str(financial_data["category"]) if "category" in financial_data else None,
+                            "id": str(financial_data["id"]) if "id" in financial_data else None,
+                            "entity_name": str(record["t"].get("name")) if record["t"] and "name" in record["t"] else "Unbekannt"
+                        }
+                        context.append(entry)
 
                 if not context:
                     logger.warning("⚠️ Keine relevanten Daten in Neo4j gefunden")
                     return [{"message": "Keine ausreichenden Daten gefunden."}]
-                
-                token_count = estimate_tokens(str(context))
+
+                token_count = estimate_tokens(json.dumps(context))
                 if token_count > max_tokens:
                     context = context[:max(1, int(len(context) * max_tokens / token_count))]
                     logger.warning("⚠️ Neo4j-Kontext gekürzt")
@@ -293,7 +294,7 @@ def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> Li
         except ServiceUnavailable as e:
             logger.error(f"❌ Neo4j-Verbindungsfehler (Versuch {attempt + 1}/{retries}): {e}")
             if attempt < retries - 1:
-                time.sleep(2 ** attempt)  # Exponentielles Backoff
+                time.sleep(2 ** attempt)
                 continue
             return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
         except Exception as e:
