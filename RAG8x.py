@@ -66,7 +66,7 @@ def verify_neo4j_connection() -> bool:
         logger.info("✅ Neo4j-Verbindung erfolgreich")
         return True
     except ServiceUnavailable as e:
-        logger.error(f"❌ Neo4j-Verbindung fehlgeschlagen: {e}")
+        logger.error(f"❌ Neo4j-Verbindungsfehlgeschlagen: {e}")
         return False
 
 def load_embedding_cache() -> None:
@@ -213,80 +213,66 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         logger.error(f"❌ Fehler bei der Dokumentensuche: {e}")
         return "Fehler bei der Dokumentensuche."
 
-def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> str:
+def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> List[Dict]:
     for attempt in range(retries):
         with driver.session() as session:
             try:
-                context_lines = []
+                context = []
                 max_tokens = 8000
-                result_metrics = session.run("""
-                    MATCH (m:FinancialMetric)-[r1]-(n)
-                    WHERE m.value IS NOT NULL AND m.year IS NOT NULL
-                    RETURN m, r1, n
+                result = session.run("""
+                    MATCH (fm:FinancialMetric)-[:HAS_FINANCIAL_METRIC]->(entity)
+                    WHERE (entity:ParentCompany OR entity:Company)
+                    AND fm.value IS NOT NULL AND fm.year IS NOT NULL
+                    AND toLower(fm.name) CONTAINS $search_term
+                    AND ($year IS NULL OR fm.year = $year)
+                    RETURN fm.name AS name, fm.year AS year, fm.value AS value, fm.unit AS unit,
+                           fm.category AS category, entity.name AS entity_name
                     LIMIT $limit
-                """, limit=limit//2)
-                query_lower = user_query.lower()
-                company_filter = ""
-                if "siemens" in query_lower or "tass" in query_lower:
-                    company_filter = "WHERE p.name CONTAINS 'Siemens' OR c.name CONTAINS 'TASS'"
-                result_companies = session.run(f"""
-                    MATCH (p:ParentCompany)-[r2:HAS_PARTICIPATION]->(c:Company)
-                    {company_filter}
-                    RETURN p, r2, c
-                    LIMIT $limit
-                """, limit=limit//2)
+                """, {
+                    "search_term": user_query.lower(),
+                    "year": next((int(word) for word in user_query.split() if word.isdigit() and len(word) == 4), None)
+                })
 
-                def describe_node(node):
-                    if node is None:
-                        return "None"
-                    label = list(node.labels)[0] if node.labels else "Node"
-                    name = node.get("name") or node.get("id") or label
-                    props = ", ".join([f"{k}: {v}" for k, v in node.items() if k not in ["name", "id"] and v is not None])
-                    return f"{label}({name}) [{props}]" if props else f"{label}({name})"
+                for record in result:
+                    context.append({
+                        "name": record["name"],
+                        "year": record["year"],
+                        "value": record["value"],
+                        "unit": record["unit"],
+                        "category": record["category"],
+                        "entity_name": record["entity_name"]
+                    })
 
-                for record in result_metrics:
-                    m = record["m"]
-                    n = record["n"]
-                    r1 = record["r1"]
-                    m_desc = describe_node(m)
-                    n_desc = describe_node(n)
-                    line = f"{m_desc} -[:{r1.type}]- {n_desc}"
-                    context_lines.append(line)
-
-                for record in result_companies:
-                    p = record["p"]
-                    c = record["c"]
-                    r2 = record["r2"]
-                    p_desc = describe_node(p)
-                    c_desc = describe_node(c)
-                    props = ", ".join([f"{k}: {v}" for k, v in r2.items() if v is not None])
-                    line = f"{p_desc} -[:{r2.type} {props}]- {c_desc}"
-                    context_lines.append(line)
-
-                context = "\n".join(context_lines)
-                if estimate_tokens(context) > max_tokens:
-                    context_lines = context_lines[:max(1, int(len(context_lines) * max_tokens / estimate_tokens(context)))]
-                    context = "\n".join(context_lines)
+                if not context:
+                    logger.warning("⚠️ Keine relevanten Daten in Neo4j gefunden")
+                    return [{"message": "Keine ausreichenden Daten gefunden."}]
+                
+                token_count = estimate_tokens(str(context))
+                if token_count > max_tokens:
+                    context = context[:max(1, int(len(context) * max_tokens / token_count))]
                     logger.warning("⚠️ Neo4j-Kontext gekürzt")
-                return context or "Keine relevanten Daten in Neo4j gefunden."
+
+                return context
             except ServiceUnavailable as e:
                 logger.error(f"❌ Neo4j-Verbindungsfehler (Versuch {attempt + 1}/{retries}): {e}")
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)  # Exponentielles Backoff
                     continue
-                logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
-                return "Fehler beim Laden der Neo4j-Daten."
+                return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
             except Exception as e:
                 logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
-                return "Fehler beim Laden der Neo4j-Daten."
+                return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
 
-def generate_response(context: str, user_query: str) -> str:
-    if not context.strip():
-        return "Keine ausreichenden Daten gefunden."
+def generate_response(context: List[Dict], user_query: str) -> str:
+    if not context or (len(context) == 1 and "message" in context[0]):
+        return context[0]["message"] if "message" in context[0] else "Keine ausreichenden Daten gefunden."
+    
     max_tokens = 12000
-    if estimate_tokens(context) > max_tokens:
-        context = context[:max(1, int(len(context) * max_tokens / estimate_tokens(context)))]
+    context_text = "\n".join([f"{item['name']} ({item['entity_name']}, {item['year']}{', ' + item['category'] if item['category'] else ''}): {item['value']} {item['unit']}" for item in context])
+    if estimate_tokens(context_text) > max_tokens:
+        context_text = context_text[:max(1, int(len(context_text) * max_tokens / estimate_tokens(context_text)))]
         logger.warning("⚠️ Gesamter Kontext gekürzt")
+
     messages = [
         {
             "role": "system",
@@ -295,11 +281,12 @@ def generate_response(context: str, user_query: str) -> str:
                 "Antworte ausschließlich auf Basis der bereitgestellten Daten. "
                 "Nutze keine externen Quellen oder Vorwissen. "
                 "Wenn die Frage nach Anteilsverhältnissen oder Übernahmen fragt, suche nach Beziehungen wie HAS_PARTICIPATION und gib den sharePercentage an. "
+                "Falls mehrere passende Ergebnisse vorliegen, gib alle zurück und frage den Benutzer nach einer Auswahl. "
                 "Falls keine passenden Informationen im Kontext vorhanden sind, antworte mit 'Keine ausreichenden Daten gefunden'. "
                 "Antworte klar, präzise und in deutscher Sprache."
             )
         },
-        {"role": "user", "content": f"Kontext: {context}\nBenutzerfrage: {user_query}"}
+        {"role": "user", "content": f"Kontext: {context_text}\nBenutzerfrage: {user_query}"}
     ]
     try:
         response = client.chat.completions.create(
@@ -343,8 +330,8 @@ async def analyze(query: Query):
     try:
         graph_context = get_neo4j_context(query.question, limit=100)
         document_context = retrieve_relevant_chunks(query.question, chunk_embeddings, top_n=5)
-        combined_context = f"Neo4j-Daten:\n{graph_context}\n\nGeschäftsberichte:\n{document_context}"
-        answer = generate_response(combined_context, query.question)
+        combined_context = f"Neo4j-Daten:\n{json.dumps(graph_context, ensure_ascii=False)}\n\nGeschäftsberichte:\n{document_context}"
+        answer = generate_response(graph_context, query.question)
         return {"answer": answer}
     except Exception as e:
         logger.error(f"❌ Fehler bei der Verarbeitung: {e}")
@@ -352,4 +339,5 @@ async def analyze(query: Query):
 
 if __name__ == "__main__":
     import uvicorn
+    import json
     uvicorn.run(app, host="0.0.0.0", port=8000)
