@@ -6,6 +6,7 @@ import gdown
 import tempfile
 import numpy as np
 import logging
+import json  # Neu importiert
 from io import BytesIO
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
@@ -35,8 +36,19 @@ if not all([OPENAI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, GDRIVE_URL]):
     logger.error("❌ Umgebungsvariablen fehlen")
     raise ValueError("Bitte setze OPENAI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD und GDRIVE_URL")
 
+# Neo4j-Treiber mit verschlüsselter Verbindung initialisieren
+try:
+    driver = GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USER, NEO4J_PASSWORD),
+        encrypted=True,  # Verschlüsselte Verbindung erzwingen
+        trust="TRUST_ALL_CERTIFICATES"  # Für Testzwecke, in Produktion anpassen
+    )
+except Exception as e:
+    logger.error(f"❌ Fehler beim Initialisieren des Neo4j-Treibers: {e}")
+    raise
+
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 # FastAPI-App
 app = FastAPI()
@@ -67,6 +79,9 @@ def verify_neo4j_connection() -> bool:
         return True
     except ServiceUnavailable as e:
         logger.error(f"❌ Neo4j-Verbindungsfehlgeschlagen: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Unerwarteter Fehler bei der Neo4j-Verbindung: {e}")
         return False
 
 def load_embedding_cache() -> None:
@@ -214,9 +229,19 @@ def retrieve_relevant_chunks(query: str, chunk_embeddings: List[Tuple[str, np.nd
         return "Fehler bei der Dokumentensuche."
 
 def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> List[Dict]:
+    # Extrahiere Suchbegriff und Jahr aus der Abfrage
+    keywords = user_query.lower().split()
+    year = None
+    for word in keywords:
+        if word.isdigit() and len(word) == 4:
+            year = int(word)
+            keywords.remove(word)
+            break
+    search_term = " ".join(keywords)
+
     for attempt in range(retries):
-        with driver.session() as session:
-            try:
+        try:
+            with driver.session() as session:
                 context = []
                 max_tokens = 8000
                 result = session.run("""
@@ -229,8 +254,9 @@ def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> Li
                            fm.category AS category, entity.name AS entity_name
                     LIMIT $limit
                 """, {
-                    "search_term": user_query.lower(),
-                    "year": next((int(word) for word in user_query.split() if word.isdigit() and len(word) == 4), None)
+                    "search_term": search_term,
+                    "year": year,
+                    "limit": limit
                 })
 
                 for record in result:
@@ -253,19 +279,19 @@ def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> Li
                     logger.warning("⚠️ Neo4j-Kontext gekürzt")
 
                 return context
-            except ServiceUnavailable as e:
-                logger.error(f"❌ Neo4j-Verbindungsfehler (Versuch {attempt + 1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)  # Exponentielles Backoff
-                    continue
-                return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
-            except Exception as e:
-                logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
-                return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
+        except ServiceUnavailable as e:
+            logger.error(f"❌ Neo4j-Verbindungsfehler (Versuch {attempt + 1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # Exponentielles Backoff
+                continue
+            return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
+        except Exception as e:
+            logger.error(f"❌ Fehler beim Laden der Neo4j-Daten: {e}")
+            return [{"message": f"Fehler beim Laden der Neo4j-Daten: {e}"}]
 
-def generate_response(context: List[Dict], user_query: str) -> str:
+def generate_response(context: List[Dict], user_query: str) -> List[Dict]:
     if not context or (len(context) == 1 and "message" in context[0]):
-        return context[0]["message"] if "message" in context[0] else "Keine ausreichenden Daten gefunden."
+        return [{"message": context[0]["message"] if "message" in context[0] else "Keine ausreichenden Daten gefunden."}]
     
     max_tokens = 12000
     context_text = "\n".join([f"{item['name']} ({item['entity_name']}, {item['year']}{', ' + item['category'] if item['category'] else ''}): {item['value']} {item['unit']}" for item in context])
@@ -273,33 +299,13 @@ def generate_response(context: List[Dict], user_query: str) -> str:
         context_text = context_text[:max(1, int(len(context_text) * max_tokens / estimate_tokens(context_text)))]
         logger.warning("⚠️ Gesamter Kontext gekürzt")
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Du bist ein präziser Assistent für Siemens-Konzern-Analysen. "
-                "Antworte ausschließlich auf Basis der bereitgestellten Daten. "
-                "Nutze keine externen Quellen oder Vorwissen. "
-                "Wenn die Frage nach Anteilsverhältnissen oder Übernahmen fragt, suche nach Beziehungen wie HAS_PARTICIPATION und gib den sharePercentage an. "
-                "Falls mehrere passende Ergebnisse vorliegen, gib alle zurück und frage den Benutzer nach einer Auswahl. "
-                "Falls keine passenden Informationen im Kontext vorhanden sind, antworte mit 'Keine ausreichenden Daten gefunden'. "
-                "Antworte klar, präzise und in deutscher Sprache."
-            )
-        },
-        {"role": "user", "content": f"Kontext: {context_text}\nBenutzerfrage: {user_query}"}
-    ]
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=700,
-            temperature=0.2,
-            top_p=0.9
-        )
-        return response.choices[0].message.content.strip()
-    except openai.OpenAIError as e:
-        logger.error(f"❌ OpenAI API-Fehler: {e}")
-        return "Fehler bei der Antwortgenerierung."
+    # Wenn nur ein Ergebnis vorliegt, direkt zurückgeben
+    if len(context) == 1:
+        result = context[0]
+        return [{"name": result["name"], "year": result["year"], "value": result["value"], "unit": result["unit"], "category": result["category"], "entity_name": result["entity_name"]}]
+
+    # Wenn mehrere Ergebnisse vorliegen, Kontext direkt zurückgeben (Frontend übernimmt die Nachfrage)
+    return context
 
 # Eingabemodell für API
 class Query(BaseModel):
@@ -339,5 +345,4 @@ async def analyze(query: Query):
 
 if __name__ == "__main__":
     import uvicorn
-    import json
     uvicorn.run(app, host="0.0.0.0", port=8000)
