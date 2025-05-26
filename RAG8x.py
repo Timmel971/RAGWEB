@@ -6,7 +6,7 @@ import gdown
 import tempfile
 import numpy as np
 import logging
-import json  # Neu importiert
+import json
 from io import BytesIO
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
@@ -36,13 +36,19 @@ if not all([OPENAI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, GDRIVE_URL]):
     logger.error("❌ Umgebungsvariablen fehlen")
     raise ValueError("Bitte setze OPENAI_API_KEY, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD und GDRIVE_URL")
 
-# Neo4j-Treiber mit verschlüsselter Verbindung initialisieren
+# Überprüfe das URI-Schema
+valid_schemes = ['neo4j', 'neo4j+s', 'neo4j+ssc', 'bolt', 'bolt+s', 'bolt+ssc']
+uri_scheme = NEO4J_URI.split('://')[0]
+if uri_scheme not in valid_schemes:
+    logger.error(f"❌ Ungültiges URI-Schema: {uri_scheme}. Erlaubte Schemata: {valid_schemes}")
+    raise ValueError(f"Ungültiges URI-Schema: {uri_scheme}. Erlaubte Schemata: {valid_schemes}")
+
+# Neo4j-Treiber initialisieren
 try:
+    # Entferne encrypted und trust, da sie bei neo4j+s oder neo4j+ssc nicht benötigt werden
     driver = GraphDatabase.driver(
         NEO4J_URI,
-        auth=(NEO4J_USER, NEO4J_PASSWORD),
-        encrypted=True,  # Verschlüsselte Verbindung erzwingen
-        trust="TRUST_ALL_CERTIFICATES"  # Für Testzwecke, in Produktion anpassen
+        auth=(NEO4J_USER, NEO4J_PASSWORD)
     )
 except Exception as e:
     logger.error(f"❌ Fehler beim Initialisieren des Neo4j-Treibers: {e}")
