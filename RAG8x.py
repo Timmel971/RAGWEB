@@ -265,13 +265,19 @@ def get_neo4j_context(user_query: str, limit: int = 100, retries: int = 3) -> Li
                 })
 
                 for record in result:
+                    # Überprüfe, ob alle erforderlichen Felder vorhanden sind
+                    if (record["name"] is None or record["year"] is None or
+                        record["value"] is None or record["unit"] is None or
+                        record["entity_name"] is None):
+                        logger.warning(f"⚠️ Unvollständige Daten in Neo4j: {dict(record)}")
+                        continue  # Überspringe unvollständige Datensätze
                     context.append({
-                        "name": record["name"],
+                        "name": str(record["name"]),
                         "year": record["year"],
                         "value": record["value"],
-                        "unit": record["unit"],
-                        "category": record["category"],
-                        "entity_name": record["entity_name"]
+                        "unit": str(record["unit"]),
+                        "category": str(record["category"]) if record["category"] else None,
+                        "entity_name": str(record["entity_name"])
                     })
 
                 if not context:
@@ -304,13 +310,24 @@ def generate_response(context: List[Dict], user_query: str) -> List[Dict]:
         context_text = context_text[:max(1, int(len(context_text) * max_tokens / estimate_tokens(context_text)))]
         logger.warning("⚠️ Gesamter Kontext gekürzt")
 
+    # Überprüfe, ob alle Einträge vollständig sind
+    filtered_context = []
+    for item in context:
+        if all(key in item and item[key] is not None for key in ["name", "year", "value", "unit", "entity_name"]):
+            filtered_context.append(item)
+        else:
+            logger.warning(f"⚠️ Unvollständiger Datensatz übersprungen: {item}")
+
+    if not filtered_context:
+        return [{"message": "Keine vollständigen Daten gefunden."}]
+
     # Wenn nur ein Ergebnis vorliegt, direkt zurückgeben
-    if len(context) == 1:
-        result = context[0]
+    if len(filtered_context) == 1:
+        result = filtered_context[0]
         return [{"name": result["name"], "year": result["year"], "value": result["value"], "unit": result["unit"], "category": result["category"], "entity_name": result["entity_name"]}]
 
     # Wenn mehrere Ergebnisse vorliegen, Kontext direkt zurückgeben (Frontend übernimmt die Nachfrage)
-    return context
+    return filtered_context
 
 # Eingabemodell für API
 class Query(BaseModel):
