@@ -45,7 +45,6 @@ if uri_scheme not in valid_schemes:
 
 # Neo4j-Treiber initialisieren
 try:
-    # Entferne encrypted und trust, da sie bei neo4j+s oder neo4j+ssc nicht benötigt werden
     driver = GraphDatabase.driver(
         NEO4J_URI,
         auth=(NEO4J_USER, NEO4J_PASSWORD)
@@ -351,4 +350,7 @@ async def analyze(query: Query):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Verwende die Umgebungsvariable PORT oder fallback auf 8000
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
