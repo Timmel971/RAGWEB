@@ -1,8 +1,6 @@
-# main.py
+# main2.py
 import os
 import re
-import io
-import tempfile
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -18,17 +16,17 @@ from langchain.prompts import PromptTemplate
 # ---- RAG / PDF
 import fitz  # PyMuPDF
 from chromadb import PersistentClient
+from chromadb.config import Settings as ChromaSettings
 from chromadb.utils import embedding_functions
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
-import requests
 
 # ==================== Setup ====================
 load_dotenv()
 
-app = FastAPI(title="Graph-QA (Neo4j) + RAG PDF – Drive only")
+app = FastAPI(title="Graph-QA (Neo4j) + RAG PDF – Multi-Turn + Disambiguation")
 
-# CORS – locker für Dev
+# CORS – offen für Render + CodePen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -36,33 +34,25 @@ app.add_middleware(
         "http://localhost:8001",
         "https://codepen.io",
         "https://cdpn.io",
-        "*",
+        "*",  # für Tests
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- ENV
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
-PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
-# Nur öffentlich geteilte Drive-URL
-GDRIVE_SHARED_URL = os.getenv("GDRIVE_SHARED_URL")  # https://drive.google.com/file/d/FILEID/view?usp=sharing
-
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY ist nicht gesetzt (.env)")
 
-# ---- Neo4j connect
+# Neo4j connect
 graph = (
     Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASSWORD, database=NEO4J_DATABASE)
     if NEO4J_DATABASE
@@ -95,6 +85,16 @@ ARRAY_PROPS = ["KennzahlWert", "anteilProzent"]
 
 HOLDING_LABELS = ["Tochterunternehmen","Assoziierte_Gemeinschafts_Unternehmen","Sonstige_Beteiligungen"]
 METRIC_LABELS  = ["Periodenkennzahl","Erfolgskennzahl","Bestandskennzahl","Nachhaltigkeitskennzahl"]
+
+# Aliasse für deterministische Kennzahl+Jahr-Erkennung
+METRIC_ALIASES = {
+    "umsatzerlöse": "/Umsatzerlöse",
+    "umsatz": "/Umsatzerlöse",
+    "auftragseingang": "/Auftragseingang",
+    # weitere Beispiele:
+    # "ebit": "/EBIT",
+    # "free_cash_flow": "/Free_Cash_Flow",
+}
 
 # ======== LLM =========
 llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0, openai_api_key=OPENAI_API_KEY)
@@ -139,15 +139,15 @@ DB-Schema:
 Regeln:
 - Nur Labels: {labels_allow}
 - Nur Relationen: {rels_allow}
-- OWL/Schema-Kanten ignorieren.
-- Nie :Resource oder :NamedIndividual verwenden.
+- OWL/Schema-Kanten ignorieren (Class, ObjectProperty, DatatypeProperty, subClassOf, domain, range, Restriction, onProperty, onClass, members, first, rest, onDatatype).
+- **Nie :Resource oder :NamedIndividual** in MATCH.
 - "Tochterunternehmen" = :Tochterunternehmen|:Assoziierte_Gemeinschafts_Unternehmen|:Sonstige_Beteiligungen; zum Konzern: [:istTochterVon|hatKonzernmutter].
 - Periodenkennzahlen: (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr) und (k)-[:hatFinanzkennzahl]->(u:Konzernmutter).
 - Jahr über p.uri (ENDS WITH '#YYYY')
-- Node-Match via uri (ENDS WITH '/…').
-- Zahlenarrays immer [0].
-- Immer auch die uri zurückgeben.
-- Liefere nur die Cypher-Query, ohne Markdown.
+- Node-Match via uri/… (ENDS WITH '/…' etc.)
+- Zahlenarrays immer [0] (z. B. KennzahlWert[0], anteilProzent[0])
+- **Immer** auch die `uri` der gefundenen Kennzahl/Unternehmens zurückgeben (`... AS uri`) – zusätzlich zu `wert` falls relevant.
+- Liefere **nur** die Cypher-Query, ohne Markdown.
 
 {fewshots}
 Frage: {question}
@@ -174,6 +174,7 @@ def is_company_question(text: str) -> bool:
     ]
     return any(h in t for h in COMPANY_HINTS)
 
+# ---------- Cypher Sanitizer ----------
 def remove_generic_labels(cypher: str) -> str:
     cypher = re.sub(r":NamedIndividual\b", "", cypher)
     cypher = re.sub(r":Resource\b", "", cypher)
@@ -181,6 +182,7 @@ def remove_generic_labels(cypher: str) -> str:
 
 def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace(":Tochterunternehmen", ":Tochterunternehmen|Assoziierte_Gemeinschafts_Unternehmen|Sonstige_Beteiligungen")
+    # bereits ohne zweiten Doppelpunkt vor dem zweiten Typ
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
@@ -254,9 +256,35 @@ def std_short(std_uri: Optional[str]) -> Optional[str]:
     if "HGB" in s: return "HGB"
     return s
 
+def _norm(s: str) -> str:
+    return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").strip()
+
+METRIC_RE = re.compile(
+    r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
+    re.IGNORECASE
+)
+
+def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
+    m = METRIC_RE.search(q or "")
+    if not m:
+        return None
+    metric_raw = _norm(m.group(1))
+    year = m.group(3)
+    for key, tail in METRIC_ALIASES.items():
+        if _norm(key) in metric_raw:
+            return {"tail": tail, "year": year}
+    return None
+
 # ================= RAG / PDF =================
 
-chroma = PersistentClient(path=CHROMA_DIR)
+CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
+PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
+AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")  # optional: lokaler Pfad
+AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")   # optional: öffentliche Drive-URL (Server lädt & indiziert)
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
+# Chroma mit Telemetrie aus
+chroma = PersistentClient(path=CHROMA_DIR, settings=ChromaSettings(anonymized_telemetry=False))
 openai_ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBED_MODEL)
 
 def _get_collection():
@@ -277,8 +305,7 @@ def _pdf_to_chunks(pdf_path: str) -> List[Dict[str, Any]]:
             chunks.append({
                 "id": f"{p['page']}-{abs(hash(c))}",
                 "text": c,
-                # Quelle bewusst generisch "PDF", damit nie tmp-Dateiname auftaucht
-                "meta": {"source": "PDF", "page": p["page"]}
+                "meta": {"source": os.path.basename(pdf_path) if pdf_path else "PDF", "page": p["page"]}
             })
     return chunks
 
@@ -301,43 +328,8 @@ def _collection_count() -> int:
     except Exception:
         return 0
 
-# --- Google Drive (public) ---
-def _infer_file_id_from_shared_url(url: str) -> Optional[str]:
-    if not url:
-        return None
-    m = re.search(r"/file/d/([^/]+)/", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"[?&]id=([^&]+)", url)
-    if m:
-        return m.group(1)
-    return None
-
-def _download_gdrive_public(file_id: str) -> str:
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    with requests.Session() as s:
-        r = s.get(url, stream=True); r.raise_for_status()
-        token = next((v for k, v in r.cookies.items() if k.startswith("download_warning")), None)
-        if token:
-            r = s.get(url + f"&confirm={token}", stream=True); r.raise_for_status()
-        fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-        with os.fdopen(fd, "wb") as f:
-            for chunk in r.iter_content(32768):
-                if chunk: f.write(chunk)
-    return tmp_path
-
-def _ingest_gdrive_public(shared_url: str) -> int:
-    file_id = _infer_file_id_from_shared_url(shared_url)
-    if not file_id:
-        raise HTTPException(400, "Ungültige GDRIVE_SHARED_URL – FILEID konnte nicht extrahiert werden.")
-    tmp_pdf = _download_gdrive_public(file_id)
-    try:
-        return _ingest_pdf(tmp_pdf)
-    finally:
-        try: os.remove(tmp_pdf)
-        except Exception: pass
-
 def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    """Embedding + BM25 Kombi; erst Embedding-Retrieval, dann BM25-Re-Rank."""
     col = _get_collection()
     q = col.query(query_texts=[question], n_results=top_k*2)
     docs = q.get("documents", [[]])[0]
@@ -401,7 +393,7 @@ def _rerank_for_tables(question: str, ctx: List[Dict[str, Any]]) -> List[Dict[st
     rescored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in rescored]
 
-# ---- Parser für Regionstabellen (deterministisch) ----
+# ---- Parser für Regionstabellen ----
 REGION_ALIASES = {
     "europa": "Europa, GUS, Afrika, Naher und Mittlerer Osten",
     "amerika": "Amerika",
@@ -445,37 +437,43 @@ def _extract_region_values_from_text(text: str, need_revenue: bool, need_order: 
         values[canonical] = val
     return values
 
+# ====== Lifecycle ======
 @app.on_event("startup")
 def _ensure_rag_ready():
-    if not GDRIVE_SHARED_URL:
-        print("[RAG] GDRIVE_SHARED_URL nicht gesetzt – überspringe Auto-Ingest.")
-        return
-    try:
-        if _collection_count() == 0:
-            n = _ingest_gdrive_public(GDRIVE_SHARED_URL)
-            print(f"[RAG] Ingest aus Drive abgeschlossen: {n} Chunks.")
-        else:
-            print(f"[RAG] Sammlung '{PDF_COLLECTION}' bereits befüllt.")
-    except Exception as e:
-        print(f"[RAG] Auto-Ingest (GDrive public) Fehler: {e}")
+    # Optional: Auto-Ingest von lokaler Datei
+    if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH):
+        try:
+            if _collection_count() == 0:
+                _ingest_pdf(AUTO_PDF_PATH)
+                print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH}")
+            else:
+                print(f"[RAG] Sammlung '{PDF_COLLECTION}' bereits befüllt.")
+        except Exception as e:
+            print(f"[RAG] Auto-Ingest Fehler: {e}")
+    else:
+        print("[RAG] Kein AUTO_PDF_PATH gesetzt – Indexstatus:", _collection_count())
 
 class RAGStatus(BaseModel):
     collection: str
     count: int
-    gdrive_shared_url: Optional[str]
+    auto_pdf: bool
+    auto_pdf_path: Optional[str]
 
 @app.get("/rag/status", response_model=RAGStatus)
 def rag_status():
     return RAGStatus(
         collection=PDF_COLLECTION,
         count=_collection_count(),
-        gdrive_shared_url=GDRIVE_SHARED_URL
+        auto_pdf=bool(AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH)),
+        auto_pdf_path=AUTO_PDF_PATH if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH) else None
     )
 
-@app.post("/rag/ingest_gdrive_public")
-def rag_ingest_gdrive_public(shared_url: str = Query(..., description="Geteilter Drive-Link (öffentlich)")):
-    n = _ingest_gdrive_public(shared_url)
-    return {"ingested": n, "source": "gdrive_public"}
+@app.post("/rag/ingest_pdf")
+def rag_ingest_pdf(file_path: str):
+    if not os.path.exists(file_path):
+        raise HTTPException(400, f"Datei nicht gefunden: {file_path}")
+    n = _ingest_pdf(file_path)
+    return {"ingested": n}
 
 # ================= API =================
 
@@ -492,7 +490,7 @@ def get_schema():
         "array_props": ARRAY_PROPS,
         "holding_labels": HOLDING_LABELS,
         "metric_labels": METRIC_LABELS,
-        "metric_aliases": {}
+        "metric_aliases": METRIC_ALIASES
     }
 
 class Message(BaseModel):
@@ -545,7 +543,7 @@ def value_by_uri(uri: str = Query(..., description="Exakte URI eines Knotens (Ke
         MATCH (n {uri: $uri})
         WITH n, labels(n) AS labs
         OPTIONAL MATCH (n)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-        OPTIONAL MATCH (n)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]-(u:Konzernmutter)
+        OPTIONAL MATCH (n)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(u:Konzernmutter)
         OPTIONAL MATCH (n)-[:ausgedruecktInEinheit]->(e:Einheit)
         OPTIONAL MATCH (n)-[:erstelltNachStandard]->(std:Rechnungslegungsstandard)
         OPTIONAL MATCH (n)-[:hatStandort]->(s:Stadt)-[:liegtInLand]->(l:Land)
@@ -580,11 +578,12 @@ def value_by_uri(uri: str = Query(..., description="Exakte URI eines Knotens (Ke
         "kind": kind,
     }
 
-# ---- Graph-Ego
+# ---- Graph-Ego ----
 @app.get("/graph/ego")
 def graph_ego(uri: str, depth: int = 1, limit: int = 60):
     if depth < 1 or depth > 2:
         depth = 1
+
     q = f"""
     MATCH (center {{uri: $uri}})
     OPTIONAL MATCH p=(center)-[r*1..{depth}]-(m)
@@ -604,23 +603,29 @@ def graph_ego(uri: str, depth: int = 1, limit: int = 60):
     rows = graph.query(q, params={"uri": uri, "limit": limit})
     if not rows:
         raise HTTPException(404, "Kein Graph für diese URI gefunden.")
+
     data = rows[0]
     raw_nodes = data.get("nodes") or []
     raw_edges = data.get("edges") or []
-    out_nodes, seen = [], set()
+
+    out_nodes = []
+    seen = set()
     for n in raw_nodes:
         uid = n.get("uri")
-        if not uid or uid in seen: continue
+        if not uid or uid in seen:
+            continue
         seen.add(uid)
         labs = n.get("labels") or []
         label = labs[0] if labs else "Node"
         cap = prettify_tail(uid)
         out_nodes.append({"id": uid, "label": label, "caption": cap})
+
     out_edges = []
     for e in raw_edges:
         s = e.get("source"); t = e.get("target"); typ = e.get("type") or "REL"
         if s and t:
             out_edges.append({"source": s, "target": t, "type": typ})
+
     return {"nodes": out_nodes, "edges": out_edges}
 
 # ---- /chat_plus ----
@@ -641,7 +646,61 @@ def chat_plus(body: ChatBody):
     cypher_exec = None
     rows: List[Dict[str, Any]] = []
 
-    # -------- Graph (wenn nicht "pdf only")
+    # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
+    if not force_pdf:
+        my = parse_metric_year_question(question)
+        if my:
+            tail = my["tail"]
+            year = my["year"]
+            cypher_exec = f"""
+            MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+            OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
+            WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
+                   OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
+              AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
+            RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
+            ORDER BY uri
+            LIMIT 1
+            """.strip()
+            try:
+                rows = graph.query(cypher_exec)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+
+            if rows:
+                r0 = rows[0]
+                uri = r0.get("uri")
+                if uri:
+                    try:
+                        det = value_by_uri(uri)
+                        if det["kind"] == "metric":
+                            value = det.get("wert")
+                            year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
+                            einheit = short_name(det.get("einheit")) or ""
+                            std = std_short(det.get("standard")) or "IFRS/HGB"
+                            val_txt = de_format_number(value)
+                            label = det["label"]
+                            text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
+                            return {
+                                "mode": "answer",
+                                "cypher": "(deterministisch)",
+                                "cypher_executed": cypher_exec,
+                                "rows": rows,
+                                "answer": text
+                            }
+                    except Exception:
+                        pass
+                if "wert" in r0 and r0["wert"] is not None:
+                    return {
+                        "mode": "answer",
+                        "cypher": "(deterministisch)",
+                        "cypher_executed": cypher_exec,
+                        "rows": rows,
+                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
+                    }
+            # wenn keine Rows → normal weiter
+
+    # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
     if not force_pdf:
         cypher_in = cypher_prompt.format(
             history=history_text or "(kein Verlauf)",
@@ -668,7 +727,7 @@ def chat_plus(body: ChatBody):
                 WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
                 WITH n, toLower(n.uri) AS u
                 WHERE u CONTAINS toLower($needle)
-                OPTIONAL MATCH (n)-[:istTochterVon|:hatKonzernmutter]->(m:Konzernmutter)
+                OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
                 RETURN n.uri AS uri, m.uri AS konzern
                 ORDER BY uri
                 LIMIT 8
@@ -758,48 +817,59 @@ def chat_plus(body: ChatBody):
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
+            # --- Re-Rank wie gehabt
             ctx = _rerank_for_tables(question, ctx)
 
-            # Superlativ-Detektion
             needs_max = _is_superlative_question(question)
-            want_rev  = _want_revenue(question)
-            want_oi   = _want_order_intake(question)
+            want_rev = _want_revenue(question)
+            want_oi = _want_order_intake(question)
 
-            # 1) deterministischer Pfad
+            # --- 1) deterministischer Pfad für Superlative (falls sinnvoll)
             if needs_max and (want_rev or want_oi):
                 collected: Dict[str, float] = {}
+                used_pages, sources = set(), set()
                 for c in ctx:
                     txt = (c.get("text") or "").strip()
-                    if not txt: continue
+                    meta = c.get("meta") or {}
+                    if not txt:
+                        continue
                     vals = _extract_region_values_from_text(txt, need_revenue=want_rev, need_order=want_oi)
                     if vals:
                         for k, v in vals.items():
                             if (k not in collected) or (abs(v) > abs(collected[k])):
                                 collected[k] = v
+                    if "page" in meta:
+                        used_pages.add(meta["page"])
+                    if meta.get("source"):
+                        sources.add(meta["source"])
 
                 if collected:
                     best_key = max(collected.keys(), key=lambda k: abs(collected[k]))
                     best_val = collected[best_key]
                     metric_txt = "Umsatzerlöse" if want_rev else "Auftragseingang"
                     answer = f"{metric_txt}: höchste Region = {best_key} ({best_val:,.0f})".replace(",", ".")
-                    # Nur „PDF“ als Quelle, keine Seiten
+                    # Seiten NICHT mitschicken – UI zeigt nur Badge "PDF"
+                    source_name = ", ".join(sorted(sources)) if sources else None
                     return {
                         "mode": "answer",
-                        "answer": answer,
-                        "pdf_pages": [],
-                        "pdf_source": "PDF"
+                        "answer": answer + (f"\n\nQuelle: {source_name}" if source_name else ""),
+                        "pdf_pages": [],            # leer halten, damit die UI keine Seiten anzeigt
+                        "pdf_source": source_name or "PDF"
                     }
 
-                # Nichts eindeutig parsebar → defensiv
+                # keine eindeutigen Zahlen → defensiv
+                sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
+                source_name = ", ".join(sorted(sources)) if sources else None
                 return {
                     "mode": "answer",
-                    "answer": ans,
+                    "answer": "Keine Daten gefunden." + (f"\n\nQuelle: {source_name}" if source_name else ""),
                     "pdf_pages": [],
-                    "pdf_source": "PDF"
+                    "pdf_source": source_name or "PDF"
                 }
 
-            # 2) generischer RAG-Pfad
+            # --- 2) generischer RAG-Pfad mit Kontext-Prompt
             by_page: Dict[int, List[str]] = {}
+            sources = set()
             for c in ctx:
                 meta = c.get("meta") or {}
                 page = meta.get("page")
@@ -808,13 +878,17 @@ def chat_plus(body: ChatBody):
                 txt = (c.get("text") or "").strip()
                 if txt:
                     by_page.setdefault(page, []).append(txt)
+                if meta.get("source"):
+                    sources.add(meta["source"])
 
             excerpts = []
             for p in sorted(by_page.keys())[:5]:
                 joined = " ".join(by_page[p])
                 excerpt = re.sub(r"\s+", " ", joined).strip()
                 excerpts.append(f"— Seite {p} —\n{excerpt[:1200]}")
+
             contexts_text = "\n\n".join(excerpts) if excerpts else ""
+            source_name = ", ".join(sorted(sources)) if sources else None
 
             sys_rules = (
                 "Du bist ein sehr präziser Assistent. Antworte ausschließlich mit Informationen aus dem Kontextauszug. "
@@ -843,19 +917,18 @@ def chat_plus(body: ChatBody):
 
             if not answer_text:
                 answer_text = "Keine Daten gefunden."
-            # Nur „PDF“ nennen, ohne Seiten
+
+            # Seiten NICHT mitschicken – Frontend zeigt nur "PDF"-Badge
             return {
                 "mode": "answer",
-                "answer": answer_text,
+                "answer": answer_text + (f"\n\nQuelle: {source_name}" if source_name else ""),
                 "pdf_pages": [],
-                "pdf_source": "PDF"
+                "pdf_source": source_name or "PDF"
             }
 
     # Nichts gefunden
     return {"mode": "answer", "answer": "Keine Daten gefunden."}
 
-# -------------- main --------------
 if __name__ == "__main__":
     import uvicorn
-    # Hinweis: on_event ist in FastAPI neueren Versionen deprecated, funktioniert aber weiterhin.
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
