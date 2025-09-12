@@ -1,6 +1,8 @@
 # main2.py
 import os
 import re
+import tempfile
+import urllib.request
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -40,24 +42,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ---- ENV
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Vektorstore (lokal, wenn Render ohne Disk: ./chroma; mit Persistent Disk: /data/chroma)
-CHROMA_DIR = os.getenv("CHROMA_DIR")
-PDF_COLLECTION = os.getenv("PDF_COLLECTION")
+CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
+PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
 
-# Embeddings
-EMBED_MODEL = os.getenv("EMBED_MODEL")
+# Embeddings (achte auf EMBED_MODEL vs EMB_MODEL)
+EMBED_MODEL = os.getenv("EMBED_MODEL") or os.getenv("EMB_MODEL") or "text-embedding-3-small"
 
-# Direkt-Download-URL PDF
-AUTO_PDF_URL = os.getenv("AUTO_PDF_URL")
+# Auto-Index: Lokaler Pfad oder Direkt-Download-URL (Drive: uc?export=download&id=…)
+AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")
+AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY ist nicht gesetzt (.env)")
@@ -101,9 +105,6 @@ METRIC_ALIASES = {
     "umsatzerlöse": "/Umsatzerlöse",
     "umsatz": "/Umsatzerlöse",
     "auftragseingang": "/Auftragseingang",
-    # weitere Beispiele:
-    # "ebit": "/EBIT",
-    # "free_cash_flow": "/Free_Cash_Flow",
 }
 
 # ======== LLM =========
@@ -151,7 +152,7 @@ Regeln:
 - Nur Relationen: {rels_allow}
 - OWL/Schema-Kanten ignorieren (Class, ObjectProperty, DatatypeProperty, subClassOf, domain, range, Restriction, onProperty, onClass, members, first, rest, onDatatype).
 - **Nie :Resource oder :NamedIndividual** in MATCH.
-- "Tochterunternehmen" = :Tochterunternehmen|:Assoziierte_Gemeinschafts_Unternehmen|:Sonstige_Beteiligungen; zum Konzern: [:istTochterVon|hatKonzernmutter].
+- "Tochterunternehmen" = :Tochterunternehmen|:Assoziierte_Gemeinschafts_Unternehmen|Sonstige_Beteiligungen; zum Konzern: [:istTochterVon|hatKonzernmutter].
 - Periodenkennzahlen: (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr) und (k)-[:hatFinanzkennzahl]->(u:Konzernmutter).
 - Jahr über p.uri (ENDS WITH '#YYYY')
 - Node-Match via uri/… (ENDS WITH '/…' etc.)
@@ -192,7 +193,6 @@ def remove_generic_labels(cypher: str) -> str:
 
 def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace(":Tochterunternehmen", ":Tochterunternehmen|Assoziierte_Gemeinschafts_Unternehmen|Sonstige_Beteiligungen")
-    # bereits ohne zweiten Doppelpunkt vor dem zweiten Typ
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
@@ -216,6 +216,7 @@ def expand_uri_endswiths(cypher: str) -> str:
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
+            cand.add(f"toLower(replace(replace({var}.uri),' -','_'),'.','_')) CONTAINS toLower('{t}')")
             cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
@@ -287,13 +288,8 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
 
 # ================= RAG / PDF =================
 
-CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
-PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
-AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")  # optional: lokaler Pfad
-AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")   # optional: öffentliche Drive-URL (Server lädt & indiziert)
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
 # Chroma mit Telemetrie aus
+os.makedirs(CHROMA_DIR, exist_ok=True)
 chroma = PersistentClient(path=CHROMA_DIR, settings=ChromaSettings(anonymized_telemetry=False))
 openai_ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBED_MODEL)
 
@@ -337,6 +333,17 @@ def _collection_count() -> int:
         return col.count()
     except Exception:
         return 0
+
+def _download_to_tmp(url: str) -> str:
+    """Lädt eine Datei nach /tmp und gibt den Pfad zurück."""
+    if not url:
+        raise ValueError("URL fehlt")
+    fd, tmp_path = tempfile.mkstemp(prefix="ragpdf_", suffix=".pdf")
+    os.close(fd)
+    urllib.request.urlretrieve(url, tmp_path)
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        raise RuntimeError("Download fehlgeschlagen oder Datei leer")
+    return tmp_path
 
 def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
     """Embedding + BM25 Kombi; erst Embedding-Retrieval, dann BM25-Re-Rank."""
@@ -450,18 +457,28 @@ def _extract_region_values_from_text(text: str, need_revenue: bool, need_order: 
 # ====== Lifecycle ======
 @app.on_event("startup")
 def _ensure_rag_ready():
-    # Optional: Auto-Ingest von lokaler Datei
-    if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH):
-        try:
-            if _collection_count() == 0:
-                _ingest_pdf(AUTO_PDF_PATH)
-                print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH}")
-            else:
-                print(f"[RAG] Sammlung '{PDF_COLLECTION}' bereits befüllt.")
-        except Exception as e:
-            print(f"[RAG] Auto-Ingest Fehler: {e}")
-    else:
-        print("[RAG] Kein AUTO_PDF_PATH gesetzt – Indexstatus:", _collection_count())
+    try:
+        count_before = _collection_count()
+        # 1) Lokaler Pfad
+        if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH) and count_before == 0:
+            n = _ingest_pdf(AUTO_PDF_PATH)
+            print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH} (Chunks: {n})")
+        # 2) Remote URL (z. B. Google Drive "uc?export=download&id=…")
+        elif AUTO_PDF_URL and count_before == 0:
+            try:
+                tmp_pdf = _download_to_tmp(AUTO_PDF_URL)
+                n = _ingest_pdf(tmp_pdf)
+                print(f"[RAG] Ingest aus URL abgeschlossen: {n} Chunks. (Quelle: AUTO_PDF_URL)")
+                try:
+                    os.remove(tmp_pdf)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[RAG] Download/Index von AUTO_PDF_URL fehlgeschlagen: {e}")
+        else:
+            print(f"[RAG] Sammlung '{PDF_COLLECTION}' bereits befüllt (Count={count_before}) oder keine Quelle gesetzt.")
+    except Exception as e:
+        print(f"[RAG] Startup-Fehler: {e}")
 
 class RAGStatus(BaseModel):
     collection: str
@@ -484,6 +501,20 @@ def rag_ingest_pdf(file_path: str):
         raise HTTPException(400, f"Datei nicht gefunden: {file_path}")
     n = _ingest_pdf(file_path)
     return {"ingested": n}
+
+@app.post("/rag/ingest_pdf_url")
+def rag_ingest_pdf_url(url: str):
+    """Manuelles Ingesten einer Remote-PDF-URL."""
+    try:
+        tmp_pdf = _download_to_tmp(url)
+        n = _ingest_pdf(tmp_pdf)
+        try:
+            os.remove(tmp_pdf)
+        except Exception:
+            pass
+        return {"ingested": n, "source": url}
+    except Exception as e:
+        raise HTTPException(400, f"Download/Index fehlgeschlagen: {e}")
 
 # ================= API =================
 
@@ -858,12 +889,11 @@ def chat_plus(body: ChatBody):
                     best_val = collected[best_key]
                     metric_txt = "Umsatzerlöse" if want_rev else "Auftragseingang"
                     answer = f"{metric_txt}: höchste Region = {best_key} ({best_val:,.0f})".replace(",", ".")
-                    # Seiten NICHT mitschicken – UI zeigt nur Badge "PDF"
                     source_name = ", ".join(sorted(sources)) if sources else None
                     return {
                         "mode": "answer",
                         "answer": answer + (f"\n\nQuelle: {source_name}" if source_name else ""),
-                        "pdf_pages": [],            # leer halten, damit die UI keine Seiten anzeigt
+                        "pdf_pages": [],
                         "pdf_source": source_name or "PDF"
                     }
 
@@ -877,7 +907,7 @@ def chat_plus(body: ChatBody):
                     "pdf_source": source_name or "PDF"
                 }
 
-            # --- 2) generischer RAG-Pfad mit Kontext-Prompt
+            # --- 2) generischer RAG-Pfad
             by_page: Dict[int, List[str]] = {}
             sources = set()
             for c in ctx:
@@ -928,7 +958,6 @@ def chat_plus(body: ChatBody):
             if not answer_text:
                 answer_text = "Keine Daten gefunden."
 
-            # Seiten NICHT mitschicken – Frontend zeigt nur "PDF"-Badge
             return {
                 "mode": "answer",
                 "answer": answer_text + (f"\n\nQuelle: {source_name}" if source_name else ""),
