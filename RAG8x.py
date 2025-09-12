@@ -216,7 +216,7 @@ def expand_uri_endswiths(cypher: str) -> str:
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
-            cand.add(f"toLower(replace(replace({var}.uri),' -','_'),'.','_')) CONTAINS toLower('{t}')")
+            # KORREKTE Variante (die mit den Klammern passt):
             cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
