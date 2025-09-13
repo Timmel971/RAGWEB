@@ -36,7 +36,7 @@ app.add_middleware(
         "http://localhost:8001",
         "https://codepen.io",
         "https://cdpn.io",
-        "*",
+        "*",  # für Tests
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -52,14 +52,14 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Vektorstore
+# Vektorstore (lokal, wenn Render ohne Disk: ./chroma; mit Persistent Disk: /data/chroma)
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
 PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
 
-# Embeddings
+# Embeddings (achte auf EMBED_MODEL vs EMB_MODEL)
 EMBED_MODEL = os.getenv("EMBED_MODEL") or os.getenv("EMB_MODEL") or "text-embedding-3-small"
 
-# Auto-Index PDF
+# Auto-Index: Lokaler Pfad oder Direkt-Download-URL (Drive: uc?export=download&id=…)
 AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")
 AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")
 
@@ -100,21 +100,11 @@ ARRAY_PROPS = ["KennzahlWert", "anteilProzent"]
 HOLDING_LABELS = ["Tochterunternehmen","Assoziierte_Gemeinschafts_Unternehmen","Sonstige_Beteiligungen"]
 METRIC_LABELS  = ["Periodenkennzahl","Erfolgskennzahl","Bestandskennzahl","Nachhaltigkeitskennzahl"]
 
-# Aliasse für deterministische Kennzahl-Erkennung
+# Aliasse für deterministische Kennzahl+Jahr-Erkennung
 METRIC_ALIASES = {
     "umsatzerlöse": "/Umsatzerlöse",
     "umsatz": "/Umsatzerlöse",
     "auftragseingang": "/Auftragseingang",
-}
-
-# *** NEU: Business-Unit Aliasse (normalisiert, mit underscores) ***
-BU_ALIASES = {
-    "digital industries": "digital_industries",
-    "smart infrastructure": "smart_infrastructure",
-    "mobility": "mobility",
-    "siemens healthineers": "siemens_healthineers",
-    "siemens financial services": "siemens_financial_services",
-    "sfs": "siemens_financial_services",
 }
 
 # ======== LLM =========
@@ -186,7 +176,7 @@ def prettify_tail(uri: str) -> str:
     return re.sub(r"\s+", " ", tail.replace("_"," ").replace("%20"," ")).strip()
 
 def is_company_question(text: str) -> bool:
-    t = " " + (text or "").lower() + " "
+    t = " " + text.lower() + " "
     if "tochter" in t or "beteilig" in t:
         return True
     COMPANY_HINTS = [
@@ -226,6 +216,7 @@ def expand_uri_endswiths(cypher: str) -> str:
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
+            # KORREKTE Variante (die mit den Klammern passt):
             cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
@@ -277,37 +268,23 @@ def std_short(std_uri: Optional[str]) -> Optional[str]:
     return s
 
 def _norm(s: str) -> str:
-    return (s or "").lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss").strip()
+    return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").strip()
 
-# *** NEU: Kennzahl + optionaler Geschäftsbereich + Jahr ***
 METRIC_RE = re.compile(
-    r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b(?P<mid>.*?)(?P<year>20\d{2})",
+    r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
     re.IGNORECASE
 )
-
-def _detect_bu(text_between: str) -> Optional[str]:
-    t = _norm(text_between)
-    for k, v in BU_ALIASES.items():
-        if k in t:
-            return v  # normalisierte BU (mit underscores)
-    return None
 
 def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
     m = METRIC_RE.search(q or "")
     if not m:
         return None
     metric_raw = _norm(m.group(1))
-    year = m.group("year")
-    # Kennzahl auf URI-Tail mappen
-    tail = None
-    for key, t in METRIC_ALIASES.items():
+    year = m.group(3)
+    for key, tail in METRIC_ALIASES.items():
         if _norm(key) in metric_raw:
-            tail = t
-            break
-    if not tail:
-        return None
-    bu = _detect_bu(m.group("mid") or "")
-    return {"tail": tail, "year": year, "bu": bu}  # bu kann None sein
+            return {"tail": tail, "year": year}
+    return None
 
 # ================= RAG / PDF =================
 
@@ -358,6 +335,7 @@ def _collection_count() -> int:
         return 0
 
 def _download_to_tmp(url: str) -> str:
+    """Lädt eine Datei nach /tmp und gibt den Pfad zurück."""
     if not url:
         raise ValueError("URL fehlt")
     fd, tmp_path = tempfile.mkstemp(prefix="ragpdf_", suffix=".pdf")
@@ -368,6 +346,7 @@ def _download_to_tmp(url: str) -> str:
     return tmp_path
 
 def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    """Embedding + BM25 Kombi; erst Embedding-Retrieval, dann BM25-Re-Rank."""
     col = _get_collection()
     q = col.query(query_texts=[question], n_results=top_k*2)
     docs = q.get("documents", [[]])[0]
@@ -381,7 +360,7 @@ def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
     pairs = pairs[:top_k]
     return [{"text": d, "meta": m} for d, m, _ in pairs]
 
-# ---- Reranking-Helfer ----
+# ---- Reranking & Superlativ-Helfer ----
 REGION_KEYWORDS = [
     "europa, gus, afrika, naher und mittlerer osten",
     "amerika", "asien, australien",
@@ -401,16 +380,16 @@ def _keyword_boost(s: str, kws: List[str]) -> float:
     return sum(5.0 for k in kws if k in t)
 
 def _is_superlative_question(q: str) -> bool:
-    ql = (q or "").toLowerCase() if hasattr(q, "toLowerCase") else (q or "").lower()
+    ql = q.lower()
     triggers = ["höchste", "höchsten", "größte", "groesste", "max", "top", "am meisten", "höchster", "höchstes"]
     return any(w in ql for w in triggers)
 
 def _want_revenue(q: str) -> bool:
-    ql = (q or "").lower()
+    ql = q.lower()
     return any(w in ql for w in ["umsatz", "umsatzerlöse", "umsatzerloese"])
 
 def _want_order_intake(q: str) -> bool:
-    ql = (q or "").lower()
+    ql = q.lower()
     return "auftragseingang" in ql
 
 def _rerank_for_tables(question: str, ctx: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -431,6 +410,7 @@ def _rerank_for_tables(question: str, ctx: List[Dict[str, Any]]) -> List[Dict[st
     rescored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in rescored]
 
+# ---- Parser für Regionstabellen ----
 REGION_ALIASES = {
     "europa": "Europa, GUS, Afrika, Naher und Mittlerer Osten",
     "amerika": "Amerika",
@@ -479,9 +459,11 @@ def _extract_region_values_from_text(text: str, need_revenue: bool, need_order: 
 def _ensure_rag_ready():
     try:
         count_before = _collection_count()
+        # 1) Lokaler Pfad
         if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH) and count_before == 0:
             n = _ingest_pdf(AUTO_PDF_PATH)
             print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH} (Chunks: {n})")
+        # 2) Remote URL (z. B. Google Drive "uc?export=download&id=…")
         elif AUTO_PDF_URL and count_before == 0:
             try:
                 tmp_pdf = _download_to_tmp(AUTO_PDF_URL)
@@ -522,6 +504,7 @@ def rag_ingest_pdf(file_path: str):
 
 @app.post("/rag/ingest_pdf_url")
 def rag_ingest_pdf_url(url: str):
+    """Manuelles Ingesten einer Remote-PDF-URL."""
     try:
         tmp_pdf = _download_to_tmp(url)
         n = _ingest_pdf(tmp_pdf)
@@ -704,39 +687,22 @@ def chat_plus(body: ChatBody):
     cypher_exec = None
     rows: List[Dict[str, Any]] = []
 
-    # ---- deterministischer Kennzahl+Jahr (+optional BU) Pfad
+    # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
             tail = my["tail"]
             year = my["year"]
-            bu = my.get("bu")
-
-            if bu:
-                cypher_exec = f"""
-                MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-                OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
-                OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
-                WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
-                       OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
-                  AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
-                  AND toLower(gb.uri) CONTAINS '/{bu}'
-                RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
-                ORDER BY uri
-                LIMIT 1
-                """.strip()
-            else:
-                cypher_exec = f"""
-                MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-                OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
-                WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
-                       OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
-                  AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
-                RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
-                ORDER BY uri
-                LIMIT 1
-                """.strip()
-
+            cypher_exec = f"""
+            MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+            OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
+            WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
+                   OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
+              AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
+            RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
+            ORDER BY uri
+            LIMIT 1
+            """.strip()
             try:
                 rows = graph.query(cypher_exec)
             except Exception as e:
@@ -892,14 +858,14 @@ def chat_plus(body: ChatBody):
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
-            # --- Re-Rank
+            # --- Re-Rank wie gehabt
             ctx = _rerank_for_tables(question, ctx)
 
             needs_max = _is_superlative_question(question)
             want_rev = _want_revenue(question)
             want_oi = _want_order_intake(question)
 
-            # --- deterministischer Superlativpfad
+            # --- 1) deterministischer Pfad für Superlative (falls sinnvoll)
             if needs_max and (want_rev or want_oi):
                 collected: Dict[str, float] = {}
                 used_pages, sources = set(), set()
@@ -931,6 +897,7 @@ def chat_plus(body: ChatBody):
                         "pdf_source": source_name or "PDF"
                     }
 
+                # keine eindeutigen Zahlen → defensiv
                 sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
                 source_name = ", ".join(sorted(sources)) if sources else None
                 return {
@@ -940,7 +907,7 @@ def chat_plus(body: ChatBody):
                     "pdf_source": source_name or "PDF"
                 }
 
-            # --- generischer RAG-Pfad
+            # --- 2) generischer RAG-Pfad
             by_page: Dict[int, List[str]] = {}
             sources = set()
             for c in ctx:
