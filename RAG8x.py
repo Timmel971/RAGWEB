@@ -773,39 +773,68 @@ def chat_plus(body: ChatBody):
 
     print(f"Query: {question}, Mode: {'Graph' if force_graph else 'RAG' if force_pdf else 'Hybrid'}")
 
-    # NEW: Früher Pfad für narrative Fragen (Ausblick/Prognose) -> direkt RAG
-    if not force_graph and is_outlook_question(question):
-        boosted_q = question + " Ausblick Prognose Outlook Guidance Erwartung Trend Digital Industries"
-        ctx = _query_rag(boosted_q, top_k=12)
-        ql = question.lower()
-        if "digital" in ql and "industr" in ql:
-            filt = [c for c in (ctx or []) if "digital" in (c.get("text","").lower()) or "industr" in (c.get("text","").lower())]
-            if filt: ctx = filt
-        if ctx:
-            snippets = []
-            by_page = {}
-            for c in ctx:
-                meta = c.get("meta") or {}
-                page = meta.get("page")
-                if page:
-                    by_page.setdefault(page, []).append((c.get("text") or "").strip())
-            for p in sorted(by_page.keys())[:5]:
-                joined = " ".join(by_page[p])
-                snippets.append(f"— Seite {p} —\n" + re.sub(r"\s+", " ", joined)[:1200])
-            prompt = (
-                "Du bist präzise. Antworte nur anhand des Kontexts. "
-                "Fasse die Aussagen zum erwarteten Markt-/Geschäftsverlauf (Ausblick) knapp zusammen, "
-                "gerne in 2–5 Bulletpoints. Keine Spekulation, nur Inhalte aus dem Kontext.\n\n"
-                f"Kontext:\n{'\n\n'.join(snippets)}\n\nFrage: {question}\n\nAntwort:"
-            )
-            try:
-                raw = llm.invoke(prompt)
-                ans = (raw.content if hasattr(raw, "content") else str(raw)).strip() or "Keine Daten gefunden."
-            except Exception:
-                ans = "Keine Daten gefunden."
-            sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
-            src_txt = ", ".join(sorted(s for s in sources if s)) or "PDF"
-            return {"mode": "answer", "answer": ans + f"\n\nQuelle: {src_txt}", "pdf_pages": [], "pdf_source": src_txt}
+    Ja — hier ist dein Block **fix & drop-in ready**:
+
+* kein Backslash mehr in f-String-Ausdrücken
+* inkl. kurzer „Assistent-Identität“ und Regeln
+* restliche Logik unverändert
+
+# NEW: Früher Pfad für narrative Fragen (Ausblick/Prognose) -> direkt RAG
+if not force_graph and is_outlook_question(question):
+    boosted_q = question + " Ausblick Prognose Outlook Guidance Erwartung Trend Digital Industries"
+    ctx = _query_rag(boosted_q, top_k=12)
+    ql = question.lower()
+    if "digital" in ql and "industr" in ql:
+        filt = [c for c in (ctx or []) if "digital" in (c.get("text","").lower()) or "industr" in (c.get("text","").lower())]
+        if filt:
+            ctx = filt
+    if ctx:
+        snippets = []
+        by_page = {}
+        for c in ctx:
+            meta = c.get("meta") or {}
+            page = meta.get("page")
+            if page:
+                by_page.setdefault(page, []).append((c.get("text") or "").strip())
+        for p in sorted(by_page.keys())[:5]:
+            joined = " ".join(by_page[p])
+            snippets.append("— Seite " + str(p) + " —\n" + re.sub(r"\s+", " ", joined)[:1200])
+
+        # --- Assistent-Identität & Regeln (lokal, falls nicht global definiert) ---
+        ASSISTANT_IDENTITY = (
+            "Du bist ein sehr präziser, faktenbasierter Assistent für Finanz- und Geschäftsberichte "
+            "(RAG über Unternehmens-PDFs + Graph-Abfragen). "
+            "Du antwortest knapp, sachlich und ausschließlich mit Informationen, "
+            "die im Kontext explizit belegt sind. Keine Spekulation."
+        )
+        OUTLOOK_RULES = (
+            "Antworte nur anhand des Kontexts. "
+            "Fasse die Aussagen zum erwarteten Markt-/Geschäftsverlauf (Ausblick) knapp zusammen, "
+            "gerne in 2–5 Bulletpoints. Keine Spekulation, nur Inhalte aus dem Kontext."
+        )
+
+        # --- Backslash-sichere Prompt-Konstruktion ---
+        joiner = "\n\n"
+        context_block = joiner.join(snippets)
+        question_str = str(question or "").strip()
+
+        prompt = (
+            ASSISTANT_IDENTITY + "\n\n"
+            + OUTLOOK_RULES + "\n\n"
+            + "Kontext:\n" + context_block + "\n\n"
+            + "Frage: " + question_str + "\n\n"
+            + "Antwort:"
+        )
+
+        try:
+            raw = llm.invoke(prompt)
+            ans = (raw.content if hasattr(raw, "content") else str(raw)).strip() or "Keine Daten gefunden."
+        except Exception:
+            ans = "Keine Daten gefunden."
+
+        sources = {(c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source")}
+        src_txt = ", ".join(sorted(s for s in sources if s)) or "PDF"
+        return {"mode": "answer", "answer": ans + "\n\nQuelle: " + src_txt, "pdf_pages": [], "pdf_source": src_txt}
 
     # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
     if not force_pdf:
