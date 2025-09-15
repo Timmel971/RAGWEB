@@ -100,10 +100,10 @@ ARRAY_PROPS = ["KennzahlWert", "anteilProzent"]
 HOLDING_LABELS = ["Tochterunternehmen","Assoziierte_Gemeinschafts_Unternehmen","Sonstige_Beteiligungen"]
 METRIC_LABELS  = ["Periodenkennzahl","Erfolgskennzahl","Bestandskennzahl","Nachhaltigkeitskennzahl"]
 
-# Aliasse für deterministische Kennzahl+Jahr-Erkennung
+# Aliasse (Auftragseingang bleibt Tail; Umsatzerlöse behandeln wir als Keyword)
 METRIC_ALIASES = {
-    "umsatzerlöse": "/Umsatzerlöse",
-    "umsatz": "/Umsatzerlöse",
+    "umsatzerlöse": "/Umsatzerlöse",  # wird unten zu keyword gewandelt
+    "umsatz": "/Umsatzerlöse",        # wird unten zu keyword gewandelt
     "auftragseingang": "/Auftragseingang",
 }
 
@@ -130,6 +130,16 @@ WHERE u.uri ENDS WITH '/Siemens_AG'
   AND k.uri ENDS WITH '/Auftragseingang'
 RETURN k.uri AS uri, k.KennzahlWert[0] AS wert;
 
+Beispiel 2b
+Frage: Wie hoch waren die Umsatzerlöse 2023 bei Siemens?
+Cypher:
+MATCH (k:Periodenkennzahl|Erfolgskennzahl)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr),
+      (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(u:Konzernmutter)
+WHERE u.uri ENDS WITH '/Siemens_AG'
+  AND (p.uri ENDS WITH '#2023' OR p.uri ENDS WITH '/2023' OR toLower(k.uri) CONTAINS '_2023')
+  AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
+RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert, p.uri AS periode;
+
 Beispiel 3
 Frage: Was kannst du mir zur Berliner Vermögensverwaltung GmbH sagen?
 Cypher:
@@ -153,7 +163,7 @@ Regeln:
 - OWL/Schema-Kanten ignorieren (Class, ObjectProperty, DatatypeProperty, subClassOf, domain, range, Restriction, onProperty, onClass, members, first, rest, onDatatype).
 - **Nie :Resource oder :NamedIndividual** in MATCH.
 - "Tochterunternehmen" = :Tochterunternehmen|:Assoziierte_Gemeinschafts_Unternehmen|Sonstige_Beteiligungen; zum Konzern: [:istTochterVon|hatKonzernmutter].
-- Periodenkennzahlen: (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr) und (k)-[:hatFinanzkennzahl]->(u:Konzernmutter).
+- Periodenkennzahlen: (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr) und (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(u:Konzernmutter).
 - Jahr über p.uri (ENDS WITH '#YYYY')
 - Node-Match via uri/… (ENDS WITH '/…' etc.)
 - Zahlenarrays immer [0] (z. B. KennzahlWert[0], anteilProzent[0])
@@ -213,10 +223,16 @@ def expand_uri_endswiths(cypher: str) -> str:
             tail.lower(),
             tail.lower().replace(" ","_").replace(".","_").replace("-","_")
         }
+        # Umlaut-/ß-Varianten ergänzen
+        uml = (tail
+               .replace("ä","ae").replace("Ä","Ae")
+               .replace("ö","oe").replace("Ö","Oe")
+               .replace("ü","ue").replace("Ü","Ue")
+               .replace("ß","ss"))
+        bases |= { uml, uml.lower(), uml.replace(" ","_").lower() }
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
-            # KORREKTE Variante (die mit den Klammern passt):
             cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
@@ -241,6 +257,8 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     if not is_company_question(user_question):
         fixed = expand_metric_labels(fixed)
     fixed = expand_holdings(fixed)
+    # NEU: Firmen-Relation robust machen (OR)
+    fixed = fixed.replace("[:hatFinanzkennzahl]", "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]")
     fixed = expand_uri_endswiths(fixed)
     fixed = expand_year_filters(fixed)
     fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
@@ -268,7 +286,7 @@ def std_short(std_uri: Optional[str]) -> Optional[str]:
     return s
 
 def _norm(s: str) -> str:
-    return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").strip()
+    return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss").strip()
 
 METRIC_RE = re.compile(
     r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
@@ -283,6 +301,9 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
     year = m.group(3)
     for key, tail in METRIC_ALIASES.items():
         if _norm(key) in metric_raw:
+            # Sonderfall: Umsatzerlöse behandeln wir als Keyword (kein Exact-Tail im Graph)
+            if tail == "/Umsatzerlöse":
+                return {"keyword": "umsatzerlöse", "year": year}
             return {"tail": tail, "year": year}
     return None
 
@@ -691,54 +712,123 @@ def chat_plus(body: ChatBody):
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
-            tail = my["tail"]
-            year = my["year"]
-            cypher_exec = f"""
-            MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-            OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
-            WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
-                   OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
-              AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
-            RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
-            ORDER BY uri
-            LIMIT 1
-            """.strip()
-            try:
-                rows = graph.query(cypher_exec)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+            # NEU: Keyword-Fall für Umsatzerlöse → hole ALLE Varianten (GB/Reg/EU-Tax) fürs Jahr
+            if "keyword" in my:
+                year = my["year"]
+                params = {
+                    "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG",
+                    "metricKey": "umsatzerlöse",
+                    "y1": f"/{year}",
+                    "y2": f"#{year}",
+                }
+                cypher_exec = """
+                MATCH (k)-[:beziehtSichAufUnternehmen]->(:Konzernmutter {uri:$siemens})
+                MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+                WHERE (p.uri ENDS WITH $y1 OR p.uri ENDS WITH $y2)
+                  AND k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
+                  AND toLower(k.uri) CONTAINS $metricKey
+                OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
+                OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e)
+                WITH k,p,gb,e,
+                CASE 
+                  WHEN gb IS NOT NULL THEN 'GB'
+                  WHEN any(x IN k.hatKategorie WHERE toLower(x) CONTAINS 'umsatzerlöse nach regionen') THEN 'REG'
+                  WHEN any(x IN k.hatKategorie WHERE toLower(x) CONTAINS 'eu-taxonomie') THEN 'EU-TAX'
+                  ELSE 'TOTAL'
+                END AS cat
+                RETURN cat,
+                       coalesce(gb.uri, '/Total') AS gruppe,
+                       k.uri AS uri,
+                       coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert,
+                       coalesce(e.uri,'/EUR') AS einheit,
+                       p.uri AS periode
+                ORDER BY cat, gruppe, uri
+                """
+                try:
+                    rows = graph.query(cypher_exec, params=params)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-            if rows:
-                r0 = rows[0]
-                uri = r0.get("uri")
-                if uri:
-                    try:
-                        det = value_by_uri(uri)
-                        if det["kind"] == "metric":
-                            value = det.get("wert")
-                            year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
-                            einheit = short_name(det.get("einheit")) or ""
-                            std = std_short(det.get("standard")) or "IFRS/HGB"
-                            val_txt = de_format_number(value)
-                            label = det["label"]
-                            text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
-                            return {
-                                "mode": "answer",
-                                "cypher": "(deterministisch)",
-                                "cypher_executed": cypher_exec,
-                                "rows": rows,
-                                "answer": text
-                            }
-                    except Exception:
-                        pass
-                if "wert" in r0 and r0["wert"] is not None:
+                if rows:
+                    # Total bestimmen (explizit, sonst Summe der Regionen)
+                    total_row = next((r for r in rows if r["cat"] == "TOTAL" and r.get("wert") is not None), None)
+                    if not total_row:
+                        reg_vals = [r["wert"] for r in rows if r["cat"] == "REG" and r.get("wert") is not None]
+                        if reg_vals:
+                            total_row = {"wert": sum(reg_vals), "einheit": "/EUR", "uri": "SUM(Regionen)", "periode": f".../{year}"}
+                    # Antworttext bauen
+                    year_txt = str(year)
+                    parts = []
+                    if total_row:
+                        parts.append(f"**Umsatzerlöse {year_txt} (konzernweit):** {de_format_number(total_row['wert'])} {short_name(total_row.get('einheit')) or ''}")
+                    gb = [r for r in rows if r["cat"] == "GB"]
+                    reg = [r for r in rows if r["cat"] == "REG"]
+                    eu  = [r for r in rows if r["cat"] == "EU-TAX"]
+                    if gb:
+                        parts.append("**Geschäftsbereiche:**\n" + "\n".join(f"- {short_name(r['gruppe'])}: {de_format_number(r['wert'])}" for r in gb))
+                    if reg:
+                        parts.append("**Regionen:**\n" + "\n".join(f"- {short_name(r['uri'])}: {de_format_number(r['wert'])}" for r in reg))
+                    if eu:
+                        parts.append("**EU-Taxonomie:**\n" + "\n".join(f"- {short_name(r['uri'])}: {r['wert']} %" for r in eu))
                     return {
                         "mode": "answer",
-                        "cypher": "(deterministisch)",
+                        "cypher": "(deterministisch: alle Varianten)",
                         "cypher_executed": cypher_exec,
                         "rows": rows,
-                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
+                        "answer": "\n\n".join(parts) if parts else "Keine Daten gefunden."
                     }
+
+            # Bisheriger Tail-Fall (z. B. Auftragseingang)
+            if "tail" in my:
+                tail = my["tail"]
+                year = my["year"]
+                cypher_exec = f"""
+                MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+                OPTIONAL MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(u:Konzernmutter)
+                WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
+                       OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
+                  AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
+                  AND (u.uri ENDS WITH '/Siemens_AG')
+                RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert, p.uri AS periode
+                ORDER BY uri
+                LIMIT 1
+                """.strip()
+                try:
+                    rows = graph.query(cypher_exec)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+
+                if rows:
+                    r0 = rows[0]
+                    uri = r0.get("uri")
+                    if uri:
+                        try:
+                            det = value_by_uri(uri)
+                            if det["kind"] == "metric":
+                                value = det.get("wert")
+                                year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
+                                einheit = short_name(det.get("einheit")) or ""
+                                std = std_short(det.get("standard")) or "IFRS/HGB"
+                                val_txt = de_format_number(value)
+                                label = det["label"]
+                                text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
+                                return {
+                                    "mode": "answer",
+                                    "cypher": "(deterministisch)",
+                                    "cypher_executed": cypher_exec,
+                                    "rows": rows,
+                                    "answer": text
+                                }
+                        except Exception:
+                            pass
+                    if "wert" in r0 and r0["wert"] is not None:
+                        return {
+                            "mode": "answer",
+                            "cypher": "(deterministisch)",
+                            "cypher_executed": cypher_exec,
+                            "rows": rows,
+                            "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
+                        }
             # wenn keine Rows → normal weiter
 
     # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
