@@ -1000,46 +1000,52 @@ def chat_plus(body: ChatBody):
                     "rows": rows,
                     "answer": f"Umsatzerlöse ({seg_txt}), jüngste Jahre:\n" + "\n".join(lines)
                 }
-    # ---- Fallback: Umsatz ohne Jahr – jüngste 2 Jahre
-    if not rows and _want_revenue(question) and not force_pdf:
-        params = {
-            "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
-        }
-        cypher_exec = """
-        MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
-        MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-        WHERE k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
-          AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
-        OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
-        OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
-        WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert, toInteger(right(p.uri,4)) AS jahr
-        WHERE jahr IS NOT NULL
-        RETURN jahr, k.uri AS uri, wert, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
-        ORDER BY jahr DESC, gruppe ASC
-        LIMIT 100
-        """
-        try:
-            rows = graph.query(cypher_exec, params=params)
-            print(f"Generated Cypher: {cypher_exec}")
-        except Exception as e:
-            print(f"Cypher Error: {str(e)}")
-            rows = []
-        if rows:
-            years = sorted({r["jahr"] for r in rows if r.get("jahr")}, reverse=True)[:2]
-            sel = [r for r in rows if r["jahr"] in years]
-            out_lines = []
-            for y in years:
-                yr_rows = [r for r in sel if r["jahr"] == y]
-                total = next((r for r in yr_rows if r.get("gruppe") == "/Total"), None) or (yr_rows[0] if yr_rows else None)
-                if total:
-                    out_lines.append(f"- {y}: {de_format_number(total['wert'])} {short_name(total.get('einheit')) or ''}")
-            return {
-                "mode": "answer",
-                "cypher": "(fallback: Umsatz ohne Jahr – jüngste 2 Jahre)",
-                "cypher_executed": cypher_exec,
-                "rows": sel,
-                "answer": "Umsatzerlöse (konzernweit), jüngste Jahre:\n" + "\n".join(out_lines) if out_lines else "Keine Daten gefunden."
+                
+        # ---- Fallback: Umsatz ohne Jahr – jüngste 2 Jahre
+        if not rows and _want_revenue(question) and not force_pdf:
+            params = {
+                "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
             }
+            cypher_exec = """
+            MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
+            MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+            WHERE k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
+              AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
+            OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
+            OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
+            WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert, toInteger(right(p.uri,4)) AS jahr
+            WHERE jahr IS NOT NULL
+            RETURN jahr, k.uri AS uri, wert, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
+            ORDER BY jahr DESC, gruppe ASC
+            LIMIT 100
+            """
+            try:
+                rows = graph.query(cypher_exec, params=params)
+                print(f"Generated Cypher: {cypher_exec}")
+            except Exception as e:
+                print(f"Cypher Error: {str(e)}")
+                rows = []
+
+            if rows:
+                # Nimm bewusst mehrere Varianten (z. B. letzte 2 Jahre),
+                # damit len(rows) > 1 wird und die Clarify-Liste greift.
+                years = sorted({r["jahr"] for r in rows if r.get("jahr")}, reverse=True)[:2]
+                sel = [r for r in rows if (not years) or (r.get("jahr") in years)]
+
+                # Duplikate nach URI entfernen
+                seen = set()
+                deduped = []
+                for r in sel:
+                    uri = r.get("uri")
+                    if not uri or uri in seen:
+                        continue
+                    seen.add(uri)
+                    deduped.append({"uri": uri, "wert": r.get("wert")})
+
+                # Übergib die Kandidaten an die Disambiguation weiter unten.
+                rows = deduped
+                # WICHTIG: Kein return hier – der Clarify-Block übernimmt später.
+
     # ---- Graph (LLM-Cypher)
     if not force_pdf:
         cypher_in = cypher_prompt.format(
