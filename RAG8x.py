@@ -287,7 +287,7 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bAS\s+(kennzahl|id|node|knoten)\b", "AS uri", fixed, flags=re.IGNORECASE)
 
-    # Beziehungstyp-Alternativen: nach dem ersten Typ KEIN weiterer Doppelpunkt (aus ':A|:B' → ':A|B')
+    # Beziehungstyp-Alternativen: aus ':A|:B' → ':A|B'
     fixed = re.sub(r"\|\s*:", "|", fixed)
 
     # Firmenbeziehung ungerichtet machen (egal ob -> oder <-)
@@ -350,7 +350,7 @@ SH_URI = "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_
 SEG_PATTERNS = [
     (r"\bdigital\s+industries\b", DI_URI),
     (r"\bdi\b", DI_URI),
-    (r"\bsmart\s+infrastructure\b", SI_URI),  # ***kein "si" mehr!***
+    (r"\bsmart\s+infrastructure\b", SI_URI),  # kein "si" mehr!
     (r"\bmobility\b", MO_URI),
     (r"\bsiemens\s+healthineers\b", SH_URI),
     (r"\bhealthineers\b", SH_URI),
@@ -818,7 +818,7 @@ def chat_plus(body: ChatBody):
                     if reg:
                         parts.append("**Regionen:**\n" + "\n".join(f"- {short_name(r['uri'])}: {de_format_number(r['wert'])}" for r in reg))
                     if eu:
-                        parts.append("**EU-Taxonomie:**\n" + "\n".join(f"- {short_name(r['uri'])}: {r['wert']} %" for r in eu))
+                        parts.append("**EU-Taxonomie:**\n" + "\n.join(f\"- {short_name(r['uri'])}: {r['wert']} %\" for r in eu)")
                     return {
                         "mode": "answer",
                         "cypher": "(deterministisch: alle Varianten)",
@@ -919,7 +919,7 @@ def chat_plus(body: ChatBody):
                     "answer": f"Umsatzerlöse ({short_name(params['seg'])}) {yr}: {de_format_number(r.get('wert'))} EUR"
                 }
 
-    # ---- Fallback: Umsatz ohne Jahr → jüngste Periode
+    # ---- Fallback: Umsatz ohne Jahr → jüngste Periode -> jetzt KEIN direkter Return mehr
     if not rows and _want_revenue(question) and not force_pdf:
         params = {
             "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
@@ -937,21 +937,14 @@ def chat_plus(body: ChatBody):
         RETURN k.uri AS uri, wert, p.uri AS periode, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
         LIMIT 50
         """
-        rows = graph.query(cypher_exec, params=params)
-        if rows:
-            latest_year = max([int(r["periode"][-4:]) for r in rows if r.get("periode")])
-            latest = [r for r in rows if str(latest_year) in (r.get("periode") or "")]
-            total = next((r for r in latest if r.get("gruppe") == "/Total"), None) or latest[0]
-            return {
-                "mode": "answer",
-                "cypher": "(fallback: Umsatz ohne Jahr)",
-                "cypher_executed": cypher_exec,
-                "rows": latest,
-                "answer": f"Umsatzerlöse {latest_year}: {de_format_number(total['wert'])} {short_name(total.get('einheit')) or ''}"
-            }
+        all_rows = graph.query(cypher_exec, params=params)
+        if all_rows:
+            latest_year = max([int(r["periode"][-4:]) for r in all_rows if r.get("periode")])
+            rows = [r for r in all_rows if str(latest_year) in (r.get("periode") or "")]
+            # KEIN return hier -> wir lassen die Disambiguation unten greifen
 
     # -------- Graph (LLM-Cypher)
-    if not force_pdf:
+    if not force_pdf and not rows:
         cypher_in = cypher_prompt.format(
             history=history_text or "(kein Verlauf)",
             schema=schema_text,
@@ -993,7 +986,7 @@ def chat_plus(body: ChatBody):
 
         if len(rows) > 1 and not is_company_question(question):
             opts = []
-            for r in rows[:8]:
+            for r in rows[:15]:
                 uri = r.get("uri")
                 if uri:
                     opts.append({"uri": uri, "label": prettify_tail(uri), "wert": r.get("wert")})
