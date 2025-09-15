@@ -1156,7 +1156,7 @@ def chat_plus(body: ChatBody):
             if _want_order_intake(question):
                 rows = [r for r in rows if "auftrag" in _uri_lower(r)]
 
-        if len(rows) > 1 or (not rows and is_company_question(question):
+        if len(rows) > 1 or (not rows and is_company_question(question)):
             if is_company_question(question):
                 cq = """
                 MATCH (n)
