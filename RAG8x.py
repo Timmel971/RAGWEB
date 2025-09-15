@@ -242,6 +242,9 @@ def expand_year_filters(cypher: str) -> str:
     cypher = pat1.sub(lambda m: f"({m.group(1)} OR p.uri ENDS WITH '/{m.group(2)}' OR toLower(k.uri) CONTAINS '_{m.group(2)}')", cypher)
     return cypher
 
+def _question_has_year(s: str) -> bool:
+    return bool(re.search(r"\b20\d{2}\b", s or ""))
+
 def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     lowered = " " + cypher.lower().replace("\n", " ") + " "
     if any(kw in lowered for kw in [" create "," merge "," delete "," remove "," set ",
@@ -297,6 +300,18 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
         fixed,
         flags=re.IGNORECASE
     )
+
+    # --------- C) LLM-Cypher: Jahrfilter entfernen, wenn die Frage kein Jahr nennt ---------
+    if not _question_has_year(user_question):
+        # AND p.uri ENDS WITH '#2024' / '/2024' entfernen
+        fixed = re.sub(
+            r"\s+AND\s+\(*\s*p\.uri\s+ENDS\s+WITH\s*['\"]#?20\d{2}['\"]\s*\)*",
+            "",
+            fixed,
+            flags=re.IGNORECASE,
+        )
+        # optionale 'NULLS LAST' Reste säubern
+        fixed = re.sub(r"\s+NULLS\s+LAST\b", "", fixed, flags=re.IGNORECASE)
 
     return fixed
 
@@ -363,6 +378,13 @@ def _parse_metric_segment(q: str) -> Optional[Dict[str, Any]]:
             if re.search(pat, " " + qn + " "):
                 return {"metric": "umsatzerlöse", "segment_uri": uri}
     return None
+
+# ====== Narrative/Ausblick-Erkennung (NEU) ======
+OUTLOOK_TERMS = ["ausblick", "zukunft", "zukünft", "prognose", "erwart", "outlook", "guidance", "trend"]
+
+def is_outlook_question(text: str) -> bool:
+    t = " " + (text or "").lower() + " "
+    return any(term in t for term in OUTLOOK_TERMS)
 
 # ================= RAG / PDF =================
 
@@ -469,8 +491,13 @@ def _want_order_intake(q: str) -> bool:
 
 def _rerank_for_tables(question: str, ctx: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     needs_max = _is_superlative_question(question)
-    want_rev = _want_revenue(question)
-    want_oi = _want_order_intake(question)
+    want_rev  = _want_revenue(question)
+    want_oi   = _want_order_intake(question)
+
+    # NEU: Für narrative Fragen (kein Max, kein Umsatz/AE) -> keine Umwertung
+    if not (needs_max or want_rev or want_oi):
+        return ctx
+
     rescored = []
     for c in ctx:
         text = c.get("text") or ""
@@ -759,6 +786,35 @@ def chat_plus(body: ChatBody):
     cypher_exec = None
     rows: List[Dict[str, Any]] = []
 
+    # --- Früher Pfad für narrative Fragen (Ausblick/Prognose) -> direkt RAG (NEU) ---
+    if not force_graph and is_outlook_question(question):
+        boosted_q = question + " Ausblick Prognose Outlook Guidance Erwartung Trend Digital Industries"
+        ctx = _query_rag(boosted_q, top_k=12)
+        # Für Ausblick KEIN Tabellen-ReRank
+        if ctx:
+            snippets = []
+            by_page = {}
+            for c in ctx:
+                meta = c.get("meta") or {}
+                page = meta.get("page")
+                if page:
+                    by_page.setdefault(page, []).append((c.get("text") or "").strip())
+            for p in sorted(by_page.keys())[:5]:
+                joined = " ".join(by_page[p])
+                snippets.append(f"— Seite {p} —\n" + re.sub(r"\s+", " ", joined)[:1200])
+
+            prompt = (
+                "Du bist präzise. Antworte nur anhand des Kontexts. "
+                "Fasse die Aussagen zum erwarteten Markt-/Geschäftsverlauf (Ausblick) knapp zusammen, "
+                "gerne in 2–5 Bulletpoints. Keine Spekulation, nur Inhalte aus dem Kontext.\n\n"
+                f"Kontext:\n{'\n\n'.join(snippets)}\n\nFrage: {question}\n\nAntwort:"
+            )
+            raw = llm.invoke(prompt)
+            ans = (raw.content if hasattr(raw, "content") else str(raw)).strip() or "Keine Daten gefunden."
+            sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
+            src_txt = ", ".join(sorted(s for s in sources if s)) or "PDF"
+            return {"mode": "answer", "answer": ans + f"\n\nQuelle: {src_txt}", "pdf_source": src_txt}
+
     # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
     if not force_pdf:
         my = parse_metric_year_question(question)
@@ -879,7 +935,7 @@ def chat_plus(body: ChatBody):
                             "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                         }
 
-    # ---- deterministischer Pfad „Umsatz + Geschäftsbereich (ohne Jahr)“
+    # ---- deterministischer Pfad „Umsatz + Geschäftsbereich (ohne Jahr)“ — A) jüngste 2 Jahre
     if not force_pdf:
         ms = _parse_metric_segment(question)
         if ms:
@@ -897,11 +953,13 @@ def chat_plus(body: ChatBody):
             WHERE (gb.uri = segUri) OR toLower(k.uri) CONTAINS seg_tail
             MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
             OPTIONAL MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-            WITH k, p, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
+            WITH k, p,
+                 coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
                  CASE WHEN p IS NULL THEN NULL ELSE toInteger(right(p.uri,4)) END AS jahr
-            RETURN k.uri AS uri, wert, p.uri AS periode
-            ORDER BY coalesce(jahr, -1) DESC
-            LIMIT 1
+            WHERE jahr IS NOT NULL
+            RETURN k.uri AS uri, wert, p.uri AS periode, jahr
+            ORDER BY jahr DESC
+            LIMIT 2
             """
             try:
                 rows = graph.query(cypher_exec, params=params)
@@ -909,17 +967,17 @@ def chat_plus(body: ChatBody):
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
             if rows:
-                r = rows[0]
-                yr  = (r.get("periode") or "")[-4:] if r.get("periode") else "—"
+                lines = [f"- {r['jahr']}: {de_format_number(r.get('wert'))} EUR" for r in rows if r.get("jahr")]
+                seg_txt = short_name(params['seg'])
                 return {
                     "mode": "answer",
-                    "cypher": "(deterministisch: Umsatz je Geschäftsbereich, jüngste Periode)",
+                    "cypher": "(deterministisch: Umsatz je Geschäftsbereich, jüngste 2 Perioden)",
                     "cypher_executed": cypher_exec,
                     "rows": rows,
-                    "answer": f"Umsatzerlöse ({short_name(params['seg'])}) {yr}: {de_format_number(r.get('wert'))} EUR"
+                    "answer": f"Umsatzerlöse ({seg_txt}), jüngste Jahre:\n" + "\n".join(lines)
                 }
 
-    # ---- Fallback: Umsatz ohne Jahr → jüngste Periode -> jetzt KEIN direkter Return mehr
+    # ---- B) Allgemeiner Umsatz-Fallback (ohne Jahr) → jüngste 2 Jahre
     if not rows and _want_revenue(question) and not force_pdf:
         params = {
             "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
@@ -931,236 +989,203 @@ def chat_plus(body: ChatBody):
           AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
         OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
         OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
-        WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert
-        WITH k,p,gb,e,wert, toInteger(right(p.uri,4)) AS jahr
-        ORDER BY jahr DESC
-        RETURN k.uri AS uri, wert, p.uri AS periode, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
-        LIMIT 50
+        WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert, toInteger(right(p.uri,4)) AS jahr
+        WHERE jahr IS NOT NULL
+        RETURN jahr, k.uri AS uri, wert, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
+        ORDER BY jahr DESC, gruppe ASC
+        LIMIT 100
         """
         all_rows = graph.query(cypher_exec, params=params)
+        Hier ist der **fehlende Rest** deiner `main2.py` ab der Stelle `if all_rows:` — inkl. LLM-Fallback und finalem RAG-Fallback. Füge diesen Block direkt an deine Datei an:
+
+```python
         if all_rows:
-            latest_year = max([int(r["periode"][-4:]) for r in all_rows if r.get("periode")])
-            rows = [r for r in all_rows if str(latest_year) in (r.get("periode") or "")]
-            # KEIN return hier -> wir lassen die Disambiguation unten greifen
-
-    # -------- Graph (LLM-Cypher)
-    if not force_pdf and not rows:
-        cypher_in = cypher_prompt.format(
-            history=history_text or "(kein Verlauf)",
-            schema=schema_text,
-            labels_allow=", ".join(LABELS_ALLOW),
-            rels_allow=", ".join(RELS_ALLOW),
-            fewshots=FEWSHOTS,
-            question=question
-        )
-        cypher_raw = llm.invoke(cypher_in).content.strip().strip("`")
-        cypher_exec = sanitize_and_fix(cypher_raw, question)
-        try:
-            rows = graph.query(cypher_exec)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
-
-    # ---- Disambiguation & formatierte Antworten
-    if not force_pdf:
-        if (len(rows) > 1 or (not rows and is_company_question(question))):
-            if is_company_question(question):
-                cq = """
-                MATCH (n)
-                WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
-                WITH n, toLower(n.uri) AS u
-                WHERE u CONTAINS toLower($needle)
-                OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
-                RETURN n.uri AS uri, m.uri AS konzern
-                ORDER BY uri
-                LIMIT 8
-                """
-                cands = graph.query(cq, params={"holding": HOLDING_LABELS, "needle": question})
-                if cands:
-                    options = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in cands]
-                    return {
-                        "mode": "clarify",
-                        "question": "Ich habe mehrere passende Unternehmen gefunden. Welches meinst du?",
-                        "options": options,
-                        "cypher_tried": cypher_exec
-                    }
-
-        if len(rows) > 1 and not is_company_question(question):
-            opts = []
-            for r in rows[:15]:
-                uri = r.get("uri")
-                if uri:
-                    opts.append({"uri": uri, "label": prettify_tail(uri), "wert": r.get("wert")})
-            if opts:
-                return {
-                    "mode": "clarify",
-                    "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                    "options": opts,
-                    "cypher_tried": cypher_exec
-                }
-
-        if rows:
-            r0 = rows[0]
-            uri = r0.get("uri")
-            if uri:
-                try:
-                    det = value_by_uri(uri)
-                    if det["kind"] == "company":
-                        anteil = det.get("wert")
-                        anteil_txt = f"{de_format_number(anteil)} %" if anteil is not None else "100 %"
-                        konzern_txt = short_name(det.get("konzern")) or "die Konzernmutter"
-                        sitz = ""
-                        if det.get("stadt") or det.get("land"):
-                            city = short_name(det.get("stadt")) or "?"
-                            country = short_name(det.get("land")) or "?"
-                            sitz = f"\nSitz: {city}, {country}"
-                        kommentar = det.get("kommentar")
-                        kmt = f"\nKommentar: {kommentar}" if kommentar else ""
-                        text = f"Die {konzern_txt} hält {anteil_txt} an {det['label']}.{sitz}{kmt}"
-                        return {
-                            "mode": "answer",
-                            "cypher": cypher_raw,
-                            "cypher_executed": cypher_exec,
-                            "rows": rows,
-                            "answer": text
-                        }
-                    elif det["kind"] == "metric":
-                        value = det.get("wert")
-                        year = short_name(det.get("periode"))
-                        year = year.split("#")[-1] if year else "?"
-                        einheit = short_name(det.get("einheit")) or ""
-                        std = std_short(det.get("standard")) or "IFRS/HGB"
-                        val_txt = de_format_number(value)
-                        label = det["label"]
-                        text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year} auf {val_txt} {einheit}.'
-                        return {
-                            "mode": "answer",
-                            "cypher": cypher_raw,
-                            "cypher_executed": cypher_exec,
-                            "rows": rows,
-                            "answer": text
-                        }
-                except Exception:
-                    pass
-
-            if "wert" in r0 and r0["wert"] is not None:
-                return {
-                    "mode": "answer",
-                    "cypher": cypher_raw,
-                    "cypher_executed": cypher_exec,
-                    "rows": rows,
-                    "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
-                }
-
-    # ---- RAG (PDF)
-    should_use_rag = force_pdf or (not rows and not force_graph and not is_company_question(question))
-    if should_use_rag:
-        ctx = _query_rag(question, top_k=8)
-        if ctx:
-            ctx = _rerank_for_tables(question, ctx)
-
-            needs_max = _is_superlative_question(question)
-            want_rev = _want_revenue(question)
-            want_oi = _want_order_intake(question)
-
-            if needs_max and (want_rev or want_oi):
-                collected: Dict[str, float] = {}
-                used_pages, sources = set(), set()
-                for c in ctx:
-                    txt = (c.get("text") or "").strip()
-                    meta = (c.get("meta") or {})
-                    if not txt:
-                        continue
-                    vals = _extract_region_values_from_text(txt, need_revenue=want_rev, need_order=want_oi)
-                    if vals:
-                        for k, v in vals.items():
-                            if (k not in collected) or (abs(v) > abs(collected[k])):
-                                collected[k] = v
-                    if "page" in meta:
-                        used_pages.add(meta["page"])
-                    if meta.get("source"):
-                        sources.add(meta["source"])
-
-                if collected:
-                    best_key = max(collected.keys(), key=lambda k: abs(collected[k]))
-                    best_val = collected[best_key]
-                    metric_txt = "Umsatzerlöse" if want_rev else "Auftragseingang"
-                    answer = f"{metric_txt}: höchste Region = {best_key} ({best_val:,.0f})".replace(",", ".")
-                    source_name = ", ".join(sorted(sources)) if sources else None
-                    return {
-                        "mode": "answer",
-                        "answer": answer + (f"\n\nQuelle: {source_name}" if source_name else ""),
-                        "pdf_pages": [],
-                        "pdf_source": source_name or "PDF"
-                    }
-
-                sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
-                source_name = ", ".join(sorted(sources)) if sources else None
-                return {
-                    "mode": "answer",
-                    "answer": "Keine Daten gefunden." + (f"\n\nQuelle: {source_name}" if source_name else ""),
-                    "pdf_pages": [],
-                    "pdf_source": source_name or "PDF"
-                }
-
-            by_page: Dict[int, List[str]] = {}
-            sources = set()
-            for c in ctx:
-                meta = c.get("meta") or {}
-                page = meta.get("page")
-                if page is None:
-                    continue
-                txt = (c.get("text") or "").strip()
-                if txt:
-                    by_page.setdefault(page, []).append(txt)
-                if meta.get("source"):
-                    sources.add(meta.get("source"))
-
-            excerpts = []
-            for p in sorted(by_page.keys())[:5]:
-                joined = " ".join(by_page[p])
-                excerpt = re.sub(r"\s+", " ", joined).strip()
-                excerpts.append(f"— Seite {p} —\n{excerpt[:1200]}")
-
-            contexts_text = "\n\n".join(excerpts) if excerpts else ""
-            source_name = ", ".join(sorted(sources)) if sources else None
-
-            sys_rules = (
-                "Du bist ein sehr präziser Assistent. Antworte ausschließlich mit Informationen aus dem Kontextauszug. "
-                "Wenn eine Antwort im Kontext nicht belegt ist, antworte mit 'Keine Daten gefunden.' "
-                "Liefere eine kurze, vollständige Antwort in ganzen Sätzen. "
-                "Wenn konkrete Zahlen/Bezeichnungen vorhanden sind, übernimm sie exakt (inkl. Einheiten/Jahresangaben)."
-            )
-            if needs_max:
-                sys_rules += (
-                    " Bei Superlativen (z. B. 'höchste/größte') liefere nur den Eintrag mit dem größten absoluten Wert, "
-                    "sofern im Kontext eindeutig Zahlen vorliegen; sonst: 'Keine Daten gefunden.'"
-                )
-
-            prompt = (
-                f"{sys_rules}\n\n"
-                f"Kontextauszüge:\n{contexts_text}\n\n"
-                f"Frage: {question}\n\n"
-                f"Anforderungen:\n- Antworte kurz.\n- Keine Spekulation.\n- Nutze nur den Kontext.\n\nAntwort:"
-            )
-
-            try:
-                raw = llm.invoke(prompt)
-                answer_text = (raw.content if hasattr(raw, "content") else str(raw)).strip()
-            except Exception:
-                answer_text = (llm.predict(prompt) if hasattr(llm, "predict") else "").strip()
-
-            if not answer_text:
-                answer_text = "Keine Daten gefunden."
-
+            # jüngste zwei Jahre extrahieren
+            years = sorted({r["jahr"] for r in all_rows if r.get("jahr")}, reverse=True)[:2]
+            sel = [r for r in all_rows if r.get("jahr") in years]
+            # bevorzugt Total je Jahr, sonst erster Eintrag je Jahr
+            out_lines = []
+            for y in years:
+                yr_rows = [r for r in sel if r["jahr"] == y]
+                total = next((r for r in yr_rows if (r.get("gruppe") == "/Total" or short_name(r.get("gruppe")) == "Total")), None) or (yr_rows[0] if yr_rows else None)
+                if total:
+                    einheit = short_name(total.get("einheit")) or ""
+                    out_lines.append(f"- {y}: {de_format_number(total['wert'])} {einheit}".rstrip())
             return {
                 "mode": "answer",
-                "answer": answer_text + (f"\n\nQuelle: {source_name}" if source_name else ""),
-                "pdf_pages": [],
-                "pdf_source": source_name or "PDF"
+                "cypher": "(fallback: Umsatz ohne Jahr – jüngste 2 Jahre)",
+                "cypher_executed": cypher_exec,
+                "rows": sel,
+                "answer": "Umsatzerlöse (konzernweit), jüngste Jahre:\n" + ("\n".join(out_lines) if out_lines else "Keine Daten gefunden.")
             }
 
-    return {"mode": "answer", "answer": "Keine Daten gefunden."}
+    # ====== LLM -> Cypher Pfad ======
+    if not force_pdf:
+        try:
+            prompt = cypher_prompt.format(
+                history=history_text,
+                schema=schema_text,
+                labels_allow=", ".join(LABELS_ALLOW),
+                rels_allow=", ".join(RELS_ALLOW),
+                fewshots=FEWSHOTS,
+                question=question
+            )
+            raw = llm.invoke(prompt)
+            cypher_raw = (raw.content if hasattr(raw, "content") else str(raw)).strip()
+        except Exception as e:
+            cypher_raw = None
+
+        if cypher_raw:
+            try:
+                cypher_exec = sanitize_and_fix(cypher_raw, user_question=question)
+                rows = graph.query(cypher_exec)
+            except HTTPException:
+                raise
+            except Exception as e:
+                rows = []
+
+            # Falls Frage kein Jahr nennt: Ergebnis ggf. auf jüngste 2 Jahre begrenzen, wenn eine Jahr-Spalte vorhanden ist
+            if rows and not _question_has_year(question):
+                # versuche, 'periode' oder 'jahr' herauszuziehen
+                def _row_year(r: Dict[str, Any]) -> Optional[int]:
+                    if "jahr" in r and isinstance(r["jahr"], int):
+                        return r["jahr"]
+                    per = r.get("periode")
+                    if isinstance(per, str):
+                        m = re.search(r"(20\d{2})", per)
+                        if m:
+                            try:
+                                return int(m.group(1))
+                            except Exception:
+                                return None
+                    # Notfalls aus URI
+                    uri = r.get("uri")
+                    if isinstance(uri, str):
+                        m2 = re.search(r"(20\d{2})", uri)
+                        if m2:
+                            try:
+                                return int(m2.group(1))
+                            except Exception:
+                                return None
+                    return None
+
+                ys = sorted({ _row_year(r) for r in rows if _row_year(r) }, reverse=True)[:2]
+                if ys:
+                    rows = [r for r in rows if _row_year(r) in ys]
+
+            if rows:
+                # Versuche, hübschen Text zu bauen
+                # Fall 1: klassische Kennzahl mit Wert + (optional) Periode + Einheit
+                def _val(r: Dict[str, Any]) -> str:
+                    v = r.get("wert")
+                    return de_format_number(v) if v is not None else "—"
+
+                # Gruppiere nach Periode/Jahr, wenn vorhanden
+                period_keys = []
+                for r in rows:
+                    per = r.get("periode")
+                    jr = None
+                    if isinstance(per, str):
+                        m = re.search(r"(20\d{2})", per)
+                        if m:
+                            jr = m.group(1)
+                    elif "jahr" in r and r["jahr"]:
+                        jr = str(r["jahr"])
+                    period_keys.append(jr or "")
+
+                # Wenn überwiegend Perioden erkennbar → nach Jahr sortiert ausgeben
+                lines = []
+                if any(k for k in period_keys):
+                    # map: jahr -> best guess (TOTAL bevorzugen)
+                    by_year: Dict[str, List[Dict[str, Any]]] = {}
+                    for r in rows:
+                        per = r.get("periode")
+                        yr = None
+                        if isinstance(per, str):
+                            m = re.search(r"(20\d{2})", per)
+                            if m:
+                                yr = m.group(1)
+                        if not yr and r.get("jahr"):
+                            yr = str(r.get("jahr"))
+                        by_year.setdefault(yr or "—", []).append(r)
+
+                    for y in sorted(by_year.keys(), reverse=True):
+                        group = by_year[y]
+                        # Versuche TOTAL je Jahr zu finden
+                        total = next((g for g in group if (short_name(g.get("gruppe")) or "").lower() == "total"), None)
+                        if not total:
+                            total = group[0]
+                        einheit = short_name(total.get("einheit")) or ""
+                        lines.append(f"- {y}: {de_format_number(total.get('wert'))} {einheit}".rstrip())
+
+                    return {
+                        "mode": "answer",
+                        "cypher": "(LLM → Cypher)",
+                        "cypher_executed": cypher_exec,
+                        "rows": rows,
+                        "answer": "Ergebnisse:\n" + ("\n".join(lines) if lines else "Keine Daten gefunden.")
+                    }
+                else:
+                    # generische Liste (max 10 Zeilen)
+                    head = ["uri", "wert", "periode", "einheit", "gruppe", "cat", "jahr"]
+                    def _fmt_row(r: Dict[str, Any]) -> str:
+                        bits = []
+                        for k in head:
+                            if k in r and r[k] is not None:
+                                if k == "wert":
+                                    bits.append(f"{k}={de_format_number(r[k])}")
+                                else:
+                                    bits.append(f"{k}={short_name(r[k]) if isinstance(r[k], str) else r[k]}")
+                        if not bits and r:
+                            bits = [str(r)]
+                        return "- " + ", ".join(bits)
+                    pretty = "\n".join(_fmt_row(r) for r in rows[:10])
+                    more = "" if len(rows) <= 10 else f"\n… {len(rows)-10} weitere Zeilen"
+                    return {
+                        "mode": "answer",
+                        "cypher": "(LLM → Cypher)",
+                        "cypher_executed": cypher_exec,
+                        "rows": rows,
+                        "answer": f"Ergebnisse (Top 10):\n{pretty}{more}"
+                    }
+
+    # ====== Letzter Fallback: RAG (PDF) ======
+    # Wenn Graph nichts Sinnvolles liefert oder PDF explizit gewünscht ist
+    if not rows or force_pdf:
+        ctx = _query_rag(question, top_k=10)
+        if ctx:
+            # Für Zahlen-/Tabellenfragen den Re-Ranker nutzen
+            ctx2 = _rerank_for_tables(question, ctx)
+            snippets = []
+            by_page = {}
+            for c in ctx2:
+                meta = c.get("meta") or {}
+                page = meta.get("page")
+                if page:
+                    by_page.setdefault(page, []).append((c.get("text") or "").strip())
+            for p in sorted(by_page.keys())[:5]:
+                joined = " ".join(by_page[p])
+                snippets.append(f"— Seite {p} —\n" + re.sub(r"\s+", " ", joined)[:1200])
+
+            prompt = (
+                "Antworte ausschließlich anhand des Kontexts. "
+                "Wenn Zahlen gefragt sind, gib sie präzise und in Stichpunkten aus (deutsches Zahlenformat). "
+                "Wenn die Frage narrativ ist, fasse die Kernaussagen knapp in 2–5 Bulletpoints zusammen. "
+                "Keine Spekulation.\n\n"
+                f"Kontext:\n{'\n\n'.join(snippets)}\n\nFrage: {question}\n\nAntwort:"
+            )
+            raw = llm.invoke(prompt)
+            ans = (raw.content if hasattr(raw, "content") else str(raw)).strip() or "Keine Daten gefunden."
+            sources = { (c.get("meta") or {}).get("source") for c in ctx2 if (c.get("meta") or {}).get("source") }
+            src_txt = ", ".join(sorted(s for s in sources if s)) or "PDF"
+            return {"mode": "answer", "answer": ans + f"\n\nQuelle: {src_txt}", "pdf_source": src_txt}
+
+    # Wenn alles fehlschlägt:
+    return {
+        "mode": "answer",
+        "answer": "Keine Daten gefunden. Bitte präzisiere die Frage (Kennzahl, Segment oder Jahr), oder nutze den PDF-Modus."
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run("main2:app", host="0.0.0.0", port=int(os.getenv("PORT", 8001)), reload=True)
