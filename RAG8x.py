@@ -773,12 +773,6 @@ def chat_plus(body: ChatBody):
 
     print(f"Query: {question}, Mode: {'Graph' if force_graph else 'RAG' if force_pdf else 'Hybrid'}")
 
-    Ja — hier ist dein Block **fix & drop-in ready**:
-
-* kein Backslash mehr in f-String-Ausdrücken
-* inkl. kurzer „Assistent-Identität“ und Regeln
-* restliche Logik unverändert
-
 # NEW: Früher Pfad für narrative Fragen (Ausblick/Prognose) -> direkt RAG
 if not force_graph and is_outlook_question(question):
     boosted_q = question + " Ausblick Prognose Outlook Guidance Erwartung Trend Digital Industries"
