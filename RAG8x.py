@@ -1177,7 +1177,7 @@ def chat_plus(body: ChatBody):
                         "options": options,
                         "cypher_tried": cypher_exec
                     }
-        if len(rows) > 1 and not is_company_question(question)):
+        if len(rows) > 1 and not is_company_question(question):
             opts = []
             for r in rows[:15]:  # VERBESSERUNG: Limit auf 15 erhöht
                 uri = r.get("uri")
