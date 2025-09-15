@@ -328,22 +328,26 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
     return None
 
 # ===== Segment-Erkennung (ohne Jahr) =====
-SEG_MAP = {
-    "digital industries": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
-    "di": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
-    "smart infrastructure": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Smart_Infrastructure",
-    "si": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Smart_Infrastructure",
-    "mobility": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Mobility",
-    "siemens healthineers": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_Healthineers",
-    "healthineers": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_Healthineers",
-}
+DI_URI = "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries"
+SI_URI = "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Smart_Infrastructure"
+MO_URI = "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Mobility"
+SH_URI = "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_Healthineers"
+
+SEG_PATTERNS = [
+    (r"\bdigital\s+industries\b", DI_URI),
+    (r"\bdi\b", DI_URI),
+    (r"\bsmart\s+infrastructure\b", SI_URI),  # ***kein "si" mehr!***
+    (r"\bmobility\b", MO_URI),
+    (r"\bsiemens\s+healthineers\b", SH_URI),
+    (r"\bhealthineers\b", SH_URI),
+]
 
 def _parse_metric_segment(q: str) -> Optional[Dict[str, Any]]:
-    ql = (q or "").lower()
-    if any(w in ql for w in ["umsatz", "umsatzerlöse", "umsatzerloese"]):
-        for k, v in SEG_MAP.items():
-            if k in ql:
-                return {"metric": "umsatzerlöse", "segment_uri": v}
+    qn = re.sub(r"[^a-z0-9äöüß]+", " ", (q or "").lower())
+    if any(w in qn for w in ["umsatz", "umsatzerlöse", "umsatzerloese"]):
+        for pat, uri in SEG_PATTERNS:
+            if re.search(pat, " " + qn + " "):
+                return {"metric": "umsatzerlöse", "segment_uri": uri}
     return None
 
 # ================= RAG / PDF =================
@@ -885,7 +889,7 @@ def chat_plus(body: ChatBody):
             WITH k, p, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
                  CASE WHEN p IS NULL THEN NULL ELSE toInteger(right(p.uri,4)) END AS jahr
             RETURN k.uri AS uri, wert, p.uri AS periode
-            ORDER BY jahr DESC NULLS LAST
+            ORDER BY coalesce(jahr, -1) DESC
             LIMIT 1
             """
             try:
