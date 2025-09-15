@@ -107,6 +107,17 @@ METRIC_ALIASES = {
     "umsatzerlose_2023": "/Umsatzerlöse_2023"
 }
 
+# Zusätzliche Aliasse für generische Kennzahlen (ohne Jahr)
+METRIC_ALIASES.update({
+    "cash conversion rate": "cash_conversion_rate",
+    "ccr": "cash_conversion_rate",
+    "bilanzgewinn": "bilanzgewinn",
+    "ergebnis": "ergebnis",
+    "ergebnismarge": "ergebnismarge",
+    "roce": "roce",
+    "ebit": "ebit",
+})
+
 # NEW: Outlook-Terme für Intent-Erkennung
 OUTLOOK_TERMS = ["ausblick", "zukunft", "zukünft", "prognose", "erwart", "outlook", "guidance", "trend"]
 
@@ -195,10 +206,6 @@ def is_company_question(text: str) -> bool:
         " holding", " gruppe", " & co. kg", " co. kg", " llc", " limited"
     ]
     return any(h in t for h in COMPANY_HINTS)
-
-def is_outlook_question(text: str) -> bool:
-    t = " " + (text or "").lower() + " "
-    return any(term in t for term in OUTLOOK_TERMS)
 
 # ---------- Cypher Sanitizer ----------
 def remove_generic_labels(cypher: str) -> str:
@@ -1046,8 +1053,64 @@ def chat_plus(body: ChatBody):
                 rows = deduped
                 # WICHTIG: Kein return hier – der Clarify-Block übernimmt später.
 
-    # ---- Graph (LLM-Cypher)
-    if not force_pdf:
+        # ---- Generischer Fallback: beliebige Kennzahl ohne Jahr -> mehrere Varianten an Clarify übergeben
+        if not rows and not force_pdf:
+            def _extract_alias_key(q: str) -> Optional[str]:
+                ql = (q or "").lower()
+                for human, tail in METRIC_ALIASES.items():
+                    if human in ql:
+                        # Umsatz hat bereits eigenen Fallback oben -> hier überspringen
+                        if human in ("umsatzerlöse", "umsatz", "umsatzerlose"):
+                            return None
+                        return str(tail).lower().strip("/")
+                return None
+
+            alias = _extract_alias_key(question)
+            if alias:
+                params = {
+                    "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG",
+                    "alias": alias,
+                }
+                cypher_exec = """
+                MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
+                MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+                WHERE k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
+                  AND toLower(k.uri) CONTAINS $alias
+                OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
+                WITH k, p, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
+                     toInteger(right(p.uri,4)) AS jahr, coalesce(e.uri,'/EUR') AS einheit
+                WHERE jahr IS NOT NULL
+                RETURN jahr, k.uri AS uri, wert, einheit
+                ORDER BY jahr DESC, uri ASC
+                LIMIT 100
+                """
+                try:
+                    rows = graph.query(cypher_exec, params=params)
+                    print(f"Generated Cypher (generic metric fallback): {cypher_exec}")
+                except Exception as e:
+                    print(f"Cypher Error: {str(e)}")
+                    rows = []
+
+                if rows:
+                    # mehrere letzte Jahre auswählen (z. B. 2)
+                    years = sorted({r["jahr"] for r in rows if r.get("jahr")}, reverse=True)[:2]
+                    sel = [r for r in rows if (not years) or (r.get("jahr") in years)]
+
+                    # Duplikate nach URI entfernen -> Kandidatenliste für Clarify
+                    seen = set()
+                    deduped = []
+                    for r in sel:
+                        uri = r.get("uri")
+                        if not uri or uri in seen:
+                            continue
+                        seen.add(uri)
+                        deduped.append({"uri": uri, "wert": r.get("wert")})
+
+                    rows = deduped
+                    # Kein return – der Clarify-Block übernimmt später.
+
+    # ---- Graph (LLM-Cypher) – nur wenn bisher keine rows
+    if not force_pdf and not rows:
         cypher_in = cypher_prompt.format(
             history=history_text or "(kein Verlauf)",
             schema=schema_text,
@@ -1079,9 +1142,20 @@ def chat_plus(body: ChatBody):
             else:
                 should_use_rag = force_pdf or (not rows and not force_graph and not is_company_question(question))
     else:
-        should_use_rag = True
+        # Falls wir den LLM-Block überspringen (z. B. weil rows schon da sind)
+        should_use_rag = force_pdf
+
     # ---- Disambiguation & formatierte Antworten
     if not force_pdf and not should_use_rag:
+        # Intent-basierte Nachfilterung – verhindert fachfremde Kennzahlen in den Kandidaten
+        if rows:
+            def _uri_lower(r):
+                return (r.get("uri") or "").lower()
+            if _want_revenue(question):
+                rows = [r for r in rows if ("umsatz" in _uri_lower(r)) or ("umsatzerl" in _uri_lower(r))]
+            if _want_order_intake(question):
+                rows = [r for r in rows if "auftrag" in _uri_lower(r)]
+
         if len(rows) > 1 or (not rows and is_company_question(question)):
             if is_company_question(question):
                 cq = """
@@ -1103,7 +1177,7 @@ def chat_plus(body: ChatBody):
                         "options": options,
                         "cypher_tried": cypher_exec
                     }
-        if len(rows) > 1 and not is_company_question(question):
+        if len(rows) > 1 and not is_company_question(question)):
             opts = []
             for r in rows[:15]:  # VERBESSERUNG: Limit auf 15 erhöht
                 uri = r.get("uri")
@@ -1169,6 +1243,7 @@ def chat_plus(body: ChatBody):
                     "rows": rows,
                     "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                 }
+
     # ---- RAG (PDF)
     if should_use_rag:
         print("Graph: Keine Treffer – Fallback zu RAG")
