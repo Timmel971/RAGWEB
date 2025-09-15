@@ -52,14 +52,11 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Vektorstore (lokal, wenn Render ohne Disk: ./chroma; mit Persistent Disk: /data/chroma)
+# Vektorstore
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
 PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
-
-# Embeddings (achte auf EMBED_MODEL vs EMB_MODEL)
 EMBED_MODEL = os.getenv("EMBED_MODEL") or os.getenv("EMB_MODEL") or "text-embedding-3-small"
 
-# Auto-Index: Lokaler Pfad oder Direkt-Download-URL (Drive: uc?export=download&id=…)
 AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")
 AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")
 
@@ -100,7 +97,7 @@ ARRAY_PROPS = ["KennzahlWert", "anteilProzent"]
 HOLDING_LABELS = ["Tochterunternehmen","Assoziierte_Gemeinschafts_Unternehmen","Sonstige_Beteiligungen"]
 METRIC_LABELS  = ["Periodenkennzahl","Erfolgskennzahl","Bestandskennzahl","Nachhaltigkeitskennzahl"]
 
-# Aliasse (Auftragseingang bleibt Tail; Umsatzerlöse behandeln wir als Keyword)
+# Aliasse (Auftragseingang bleibt Tail; Umsatzerlöse als Keyword)
 METRIC_ALIASES = {
     "umsatzerlöse": "/Umsatzerlöse",  # wird unten zu keyword gewandelt
     "umsatz": "/Umsatzerlöse",        # wird unten zu keyword gewandelt
@@ -223,7 +220,6 @@ def expand_uri_endswiths(cypher: str) -> str:
             tail.lower(),
             tail.lower().replace(" ","_").replace(".","_").replace("-","_")
         }
-        # Umlaut-/ß-Varianten ergänzen
         uml = (tail
                .replace("ä","ae").replace("Ä","Ae")
                .replace("ö","oe").replace("Ö","Oe")
@@ -259,48 +255,33 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
         fixed = expand_metric_labels(fixed)
     fixed = expand_holdings(fixed)
 
-    # ---- NEU: Firmen-Relation robust (regex, inkl. Varianten/Spaces)
-    fixed = re.sub(
-        r"\[\s*:\s*hatfinanzkennzahl\s*\]",
-        "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]",
-        fixed,
-        flags=re.IGNORECASE,
-    )
-    fixed = re.sub(
-        r"(\[\s*:[^\]]*?)\bhatfinanzkennzahl\b",
-        r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl",
-        fixed,
-        flags=re.IGNORECASE,
-    )
-    # -[r:hatFinanzkennzahl]-> mit Variablennamen
-    fixed = re.sub(
-        r"(\[\s*\w+\s*:\s*)([^]\|]*?)\bhatfinanzkennzahl\b",
-        r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl",
-        fixed,
-        flags=re.IGNORECASE,
-    )
+    # Firmen-Relation robust (regex)
+    fixed = re.sub(r"\[\s*:\s*hatfinanzkennzahl\s*\]",
+                   "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]", fixed, flags=re.IGNORECASE)
+    fixed = re.sub(r"(\[\s*:[^\]]*?)\bhatfinanzkennzahl\b",
+                   r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl", fixed, flags=re.IGNORECASE)
+    fixed = re.sub(r"(\[\s*\w+\s*:\s*)([^]\|]*?)\bhatfinanzkennzahl\b",
+                   r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl", fixed, flags=re.IGNORECASE)
 
-    # ---- NEU: Segment-Kante ungerichtet machen
+    # Segment-Kante ungerichtet
     fixed = re.sub(r"-\s*\[\s*:\s*segmentiertNachGeschaeftsbereich\s*\]\s*->",
                    "-[:segmentiertNachGeschaeftsbereich]-", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"<-\s*\[\s*:\s*segmentiertNachGeschaeftsbereich\s*\]\s*-",
                    "-[:segmentiertNachGeschaeftsbereich]-", fixed, flags=re.IGNORECASE)
 
-    # ---- NEU: Umsatz nie als Tail erzwingen → auf CONTAINS weiten
+    # Umsatz nie als Tail → CONTAINS
     fixed = re.sub(
         r"toLower\(\s*([A-Za-z_]\w*)\.uri\s*\)\s*ENDS\s*WITH\s*toLower\('\/?umsatzerl(ö|oe)se'\)",
         r"( toLower(\1.uri) CONTAINS 'umsatzerlöse' OR toLower(\1.uri) CONTAINS 'umsatz' )",
-        fixed,
-        flags=re.IGNORECASE,
+        fixed, flags=re.IGNORECASE,
     )
 
     fixed = expand_uri_endswiths(fixed)
     fixed = expand_year_filters(fixed)
 
-    # Aliasse von Rückgabespalten harmonisieren
+    # Rückgabespalten harmonisieren
     fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
-    # manche LLMs nennen uri anders:
     fixed = re.sub(r"\bAS\s+(kennzahl|id|node|knoten)\b", "AS uri", fixed, flags=re.IGNORECASE)
 
     return fixed
@@ -341,13 +322,12 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
     year = m.group(3)
     for key, tail in METRIC_ALIASES.items():
         if _norm(key) in metric_raw:
-            # Sonderfall: Umsatzerlöse behandeln wir als Keyword (kein Exact-Tail im Graph)
             if tail == "/Umsatzerlöse":
                 return {"keyword": "umsatzerlöse", "year": year}
             return {"tail": tail, "year": year}
     return None
 
-# ===== Zusatz: Segment-Erkennung für Umsatzerlöse ohne Jahr =====
+# ===== Segment-Erkennung (ohne Jahr) =====
 SEG_MAP = {
     "digital industries": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
     "di": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
@@ -368,7 +348,6 @@ def _parse_metric_segment(q: str) -> Optional[Dict[str, Any]]:
 
 # ================= RAG / PDF =================
 
-# Chroma mit Telemetrie aus
 os.makedirs(CHROMA_DIR, exist_ok=True)
 chroma = PersistentClient(path=CHROMA_DIR, settings=ChromaSettings(anonymized_telemetry=False))
 openai_ef = embedding_functions.OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBED_MODEL)
@@ -415,7 +394,6 @@ def _collection_count() -> int:
         return 0
 
 def _download_to_tmp(url: str) -> str:
-    """Lädt eine Datei nach /tmp und gibt den Pfad zurück."""
     if not url:
         raise ValueError("URL fehlt")
     fd, tmp_path = tempfile.mkstemp(prefix="ragpdf_", suffix=".pdf")
@@ -426,7 +404,6 @@ def _download_to_tmp(url: str) -> str:
     return tmp_path
 
 def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
-    """Embedding + BM25 Kombi; erst Embedding-Retrieval, dann BM25-Re-Rank."""
     col = _get_collection()
     q = col.query(query_texts=[question], n_results=top_k*2)
     docs = q.get("documents", [[]])[0]
@@ -539,11 +516,9 @@ def _extract_region_values_from_text(text: str, need_revenue: bool, need_order: 
 def _ensure_rag_ready():
     try:
         count_before = _collection_count()
-        # 1) Lokaler Pfad
         if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH) and count_before == 0:
             n = _ingest_pdf(AUTO_PDF_PATH)
             print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH} (Chunks: {n})")
-        # 2) Remote URL (z. B. Google Drive "uc?export=download&id=…")
         elif AUTO_PDF_URL and count_before == 0:
             try:
                 tmp_pdf = _download_to_tmp(AUTO_PDF_URL)
@@ -584,7 +559,6 @@ def rag_ingest_pdf(file_path: str):
 
 @app.post("/rag/ingest_pdf_url")
 def rag_ingest_pdf_url(url: str):
-    """Manuelles Ingesten einer Remote-PDF-URL."""
     try:
         tmp_pdf = _download_to_tmp(url)
         n = _ingest_pdf(tmp_pdf)
@@ -771,7 +745,7 @@ def chat_plus(body: ChatBody):
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
-            # NEU: Keyword-Fall für Umsatzerlöse → hole ALLE Varianten (GB/Reg/EU-Tax) fürs Jahr
+            # Keyword-Fall für Umsatzerlöse → alle Varianten (GB/Reg/EU-Tax) fürs Jahr
             if "keyword" in my:
                 year = my["year"]
                 params = {
@@ -781,7 +755,8 @@ def chat_plus(body: ChatBody):
                     "y2": f"#{year}",
                 }
                 cypher_exec = """
-                MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(:Konzernmutter {uri:$siemens})
+                MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
+                      (:Konzernmutter {uri:$siemens})
                 MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
                 WHERE (p.uri ENDS WITH $y1 OR p.uri ENDS WITH $y2)
                   AND k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
@@ -809,13 +784,11 @@ def chat_plus(body: ChatBody):
                     raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
                 if rows:
-                    # Total bestimmen (explizit, sonst Summe der Regionen)
                     total_row = next((r for r in rows if r["cat"] == "TOTAL" and r.get("wert") is not None), None)
                     if not total_row:
                         reg_vals = [r["wert"] for r in rows if r["cat"] == "REG" and r.get("wert") is not None]
                         if reg_vals:
                             total_row = {"wert": sum(reg_vals), "einheit": "/EUR", "uri": "SUM(Regionen)", "periode": f".../{year}"}
-                    # Antworttext bauen
                     year_txt = str(year)
                     parts = []
                     if total_row:
@@ -826,7 +799,7 @@ def chat_plus(body: ChatBody):
                     if gb:
                         parts.append("**Geschäftsbereiche:**\n" + "\n".join(f"- {short_name(r['gruppe'])}: {de_format_number(r['wert'])}" for r in gb))
                     if reg:
-                        parts.append("**Regionen:**\n" + "\n.join(f\"- {short_name(r['uri'])}: {de_format_number(r['wert'])}\" for r in reg)")
+                        parts.append("**Regionen:**\n" + "\n".join(f"- {short_name(r['uri'])}: {de_format_number(r['wert'])}" for r in reg))
                     if eu:
                         parts.append("**EU-Taxonomie:**\n" + "\n".join(f"- {short_name(r['uri'])}: {r['wert']} %" for r in eu))
                     return {
@@ -837,13 +810,14 @@ def chat_plus(body: ChatBody):
                         "answer": "\n\n".join(parts) if parts else "Keine Daten gefunden."
                     }
 
-            # Bisheriger Tail-Fall (z. B. Auftragseingang)
+            # Tail-Fall (z. B. Auftragseingang)
             if "tail" in my:
                 tail = my["tail"]
                 year = my["year"]
                 cypher_exec = f"""
                 MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-                OPTIONAL MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(u:Konzernmutter)
+                OPTIONAL MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
+                               (u:Konzernmutter)
                 WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
                        OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
                   AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
@@ -888,9 +862,8 @@ def chat_plus(body: ChatBody):
                             "rows": rows,
                             "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                         }
-            # wenn keine Rows → normal weiter
 
-    # ---- NEU: deterministischer Pfad „Umsatz + Geschäftsbereich (ohne Jahr)“
+    # ---- deterministischer Pfad „Umsatz + Geschäftsbereich (ohne Jahr)“
     if not force_pdf:
         ms = _parse_metric_segment(question)
         if ms:
@@ -903,10 +876,9 @@ def chat_plus(body: ChatBody):
             WITH segUri, toLower("_" + split(segUri,"/")[size(split(segUri,"/"))-1]) AS seg_tail
             MATCH (k)
             WHERE (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
-              AND (
-                (k)-[:segmentiertNachGeschaeftsbereich]-(:Geschaeftsbereiche {uri:segUri})
-                OR toLower(k.uri) CONTAINS seg_tail
-              )
+            OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]-(gb:Geschaeftsbereiche)
+            WITH k, seg_tail, segUri, gb
+            WHERE (gb.uri = segUri) OR toLower(k.uri) CONTAINS seg_tail
             MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
                   (:Konzernmutter {uri:$siemens})
             OPTIONAL MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
@@ -932,7 +904,7 @@ def chat_plus(body: ChatBody):
                     "answer": f"Umsatzerlöse ({short_name(params['seg'])}) {yr}: {de_format_number(r.get('wert'))} EUR"
                 }
 
-    # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
+    # -------- Graph (LLM-Cypher)
     if not force_pdf:
         cypher_in = cypher_prompt.format(
             history=history_text or "(kein Verlauf)",
@@ -949,9 +921,8 @@ def chat_plus(body: ChatBody):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-    # ---- Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
+    # ---- Disambiguation & formatierte Antworten
     if not force_pdf:
-        # Disambiguation: Firmen
         if (len(rows) > 1 or (not rows and is_company_question(question))):
             if is_company_question(question):
                 cq = """
@@ -974,7 +945,6 @@ def chat_plus(body: ChatBody):
                         "cypher_tried": cypher_exec
                     }
 
-        # Kennzahlen-Disambiguation
         if len(rows) > 1 and not is_company_question(question):
             opts = []
             for r in rows[:8]:
@@ -989,7 +959,6 @@ def chat_plus(body: ChatBody):
                     "cypher_tried": cypher_exec
                 }
 
-        # Formatierte Antworten
         if rows:
             r0 = rows[0]
             uri = r0.get("uri")
@@ -1034,7 +1003,6 @@ def chat_plus(body: ChatBody):
                 except Exception:
                     pass
 
-            # Fallback: Wert-only
             if "wert" in r0 and r0["wert"] is not None:
                 return {
                     "mode": "answer",
@@ -1044,25 +1012,23 @@ def chat_plus(body: ChatBody):
                     "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                 }
 
-    # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
+    # ---- RAG (PDF)
     should_use_rag = force_pdf or (not rows and not force_graph and not is_company_question(question))
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
-            # --- Re-Rank wie gehabt
             ctx = _rerank_for_tables(question, ctx)
 
             needs_max = _is_superlative_question(question)
             want_rev = _want_revenue(question)
             want_oi = _want_order_intake(question)
 
-            # --- 1) deterministischer Pfad für Superlative (falls sinnvoll)
             if needs_max and (want_rev or want_oi):
                 collected: Dict[str, float] = {}
                 used_pages, sources = set(), set()
                 for c in ctx:
                     txt = (c.get("text") or "").strip()
-                    meta = c.get("meta") or {}
+                    meta = (c.get("meta") or {})
                     if not txt:
                         continue
                     vals = _extract_region_values_from_text(txt, need_revenue=want_rev, need_order=want_oi)
@@ -1088,7 +1054,6 @@ def chat_plus(body: ChatBody):
                         "pdf_source": source_name or "PDF"
                     }
 
-                # keine eindeutigen Zahlen → defensiv
                 sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
                 source_name = ", ".join(sorted(sources)) if sources else None
                 return {
@@ -1098,7 +1063,6 @@ def chat_plus(body: ChatBody):
                     "pdf_source": source_name or "PDF"
                 }
 
-            # --- 2) generischer RAG-Pfad
             by_page: Dict[int, List[str]] = {}
             sources = set()
             for c in ctx:
@@ -1156,7 +1120,6 @@ def chat_plus(body: ChatBody):
                 "pdf_source": source_name or "PDF"
             }
 
-    # Nichts gefunden
     return {"mode": "answer", "answer": "Keine Daten gefunden."}
 
 if __name__ == "__main__":
