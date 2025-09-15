@@ -251,18 +251,58 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
         raise HTTPException(status_code=400, detail="Nur Leseabfragen sind erlaubt.")
     fixed = cypher.strip()
     fixed = remove_generic_labels(fixed)
+    # Arrays sicher indexieren
     for prop in ["KennzahlWert", "anteilProzent"]:
         pattern = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*)\." + re.escape(prop) + r"(?!\s*\[)")
         fixed = pattern.sub(r"coalesce(\1." + prop + r"[0], \1." + prop + r")", fixed)
     if not is_company_question(user_question):
         fixed = expand_metric_labels(fixed)
     fixed = expand_holdings(fixed)
-    # NEU: Firmen-Relation robust machen (OR)
-    fixed = fixed.replace("[:hatFinanzkennzahl]", "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]")
+
+    # ---- NEU: Firmen-Relation robust (regex, inkl. Varianten/Spaces)
+    fixed = re.sub(
+        r"\[\s*:\s*hatfinanzkennzahl\s*\]",
+        "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    fixed = re.sub(
+        r"(\[\s*:[^\]]*?)\bhatfinanzkennzahl\b",
+        r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    # -[r:hatFinanzkennzahl]-> mit Variablennamen
+    fixed = re.sub(
+        r"(\[\s*\w+\s*:\s*)([^]\|]*?)\bhatfinanzkennzahl\b",
+        r"\1beziehtSichAufUnternehmen|hatFinanzkennzahl",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+
+    # ---- NEU: Segment-Kante ungerichtet machen
+    fixed = re.sub(r"-\s*\[\s*:\s*segmentiertNachGeschaeftsbereich\s*\]\s*->",
+                   "-[:segmentiertNachGeschaeftsbereich]-", fixed, flags=re.IGNORECASE)
+    fixed = re.sub(r"<-\s*\[\s*:\s*segmentiertNachGeschaeftsbereich\s*\]\s*-",
+                   "-[:segmentiertNachGeschaeftsbereich]-", fixed, flags=re.IGNORECASE)
+
+    # ---- NEU: Umsatz nie als Tail erzwingen → auf CONTAINS weiten
+    fixed = re.sub(
+        r"toLower\(\s*([A-Za-z_]\w*)\.uri\s*\)\s*ENDS\s*WITH\s*toLower\('\/?umsatzerl(ö|oe)se'\)",
+        r"( toLower(\1.uri) CONTAINS 'umsatzerlöse' OR toLower(\1.uri) CONTAINS 'umsatz' )",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+
     fixed = expand_uri_endswiths(fixed)
     fixed = expand_year_filters(fixed)
+
+    # Aliasse von Rückgabespalten harmonisieren
     fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
+    # manche LLMs nennen uri anders:
+    fixed = re.sub(r"\bAS\s+(kennzahl|id|node|knoten)\b", "AS uri", fixed, flags=re.IGNORECASE)
+
     return fixed
 
 def de_format_number(x: Any) -> str:
@@ -305,6 +345,25 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
             if tail == "/Umsatzerlöse":
                 return {"keyword": "umsatzerlöse", "year": year}
             return {"tail": tail, "year": year}
+    return None
+
+# ===== Zusatz: Segment-Erkennung für Umsatzerlöse ohne Jahr =====
+SEG_MAP = {
+    "digital industries": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
+    "di": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Digital_Industries",
+    "smart infrastructure": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Smart_Infrastructure",
+    "si": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Smart_Infrastructure",
+    "mobility": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Mobility",
+    "siemens healthineers": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_Healthineers",
+    "healthineers": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_Healthineers",
+}
+
+def _parse_metric_segment(q: str) -> Optional[Dict[str, Any]]:
+    ql = (q or "").lower()
+    if any(w in ql for w in ["umsatz", "umsatzerlöse", "umsatzerloese"]):
+        for k, v in SEG_MAP.items():
+            if k in ql:
+                return {"metric": "umsatzerlöse", "segment_uri": v}
     return None
 
 # ================= RAG / PDF =================
@@ -722,7 +781,7 @@ def chat_plus(body: ChatBody):
                     "y2": f"#{year}",
                 }
                 cypher_exec = """
-                MATCH (k)-[:beziehtSichAufUnternehmen]->(:Konzernmutter {uri:$siemens})
+                MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(:Konzernmutter {uri:$siemens})
                 MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
                 WHERE (p.uri ENDS WITH $y1 OR p.uri ENDS WITH $y2)
                   AND k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
@@ -767,7 +826,7 @@ def chat_plus(body: ChatBody):
                     if gb:
                         parts.append("**Geschäftsbereiche:**\n" + "\n".join(f"- {short_name(r['gruppe'])}: {de_format_number(r['wert'])}" for r in gb))
                     if reg:
-                        parts.append("**Regionen:**\n" + "\n".join(f"- {short_name(r['uri'])}: {de_format_number(r['wert'])}" for r in reg))
+                        parts.append("**Regionen:**\n" + "\n.join(f\"- {short_name(r['uri'])}: {de_format_number(r['wert'])}\" for r in reg)")
                     if eu:
                         parts.append("**EU-Taxonomie:**\n" + "\n".join(f"- {short_name(r['uri'])}: {r['wert']} %" for r in eu))
                     return {
@@ -830,6 +889,48 @@ def chat_plus(body: ChatBody):
                             "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                         }
             # wenn keine Rows → normal weiter
+
+    # ---- NEU: deterministischer Pfad „Umsatz + Geschäftsbereich (ohne Jahr)“
+    if not force_pdf:
+        ms = _parse_metric_segment(question)
+        if ms:
+            params = {
+                "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG",
+                "seg": ms["segment_uri"],
+            }
+            cypher_exec = """
+            WITH $seg AS segUri
+            WITH segUri, toLower("_" + split(segUri,"/")[size(split(segUri,"/"))-1]) AS seg_tail
+            MATCH (k)
+            WHERE (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
+              AND (
+                (k)-[:segmentiertNachGeschaeftsbereich]-(:Geschaeftsbereiche {uri:segUri})
+                OR toLower(k.uri) CONTAINS seg_tail
+              )
+            MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
+                  (:Konzernmutter {uri:$siemens})
+            OPTIONAL MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+            WITH k, p, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
+                 CASE WHEN p IS NULL THEN NULL ELSE toInteger(right(p.uri,4)) END AS jahr
+            RETURN k.uri AS uri, wert, p.uri AS periode
+            ORDER BY jahr DESC NULLS LAST
+            LIMIT 1
+            """
+            try:
+                rows = graph.query(cypher_exec, params=params)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+
+            if rows:
+                r = rows[0]
+                yr  = (r.get("periode") or "")[-4:] if r.get("periode") else "—"
+                return {
+                    "mode": "answer",
+                    "cypher": "(deterministisch: Umsatz je Geschäftsbereich, jüngste Periode)",
+                    "cypher_executed": cypher_exec,
+                    "rows": rows,
+                    "answer": f"Umsatzerlöse ({short_name(params['seg'])}) {yr}: {de_format_number(r.get('wert'))} EUR"
+                }
 
     # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
     if not force_pdf:
@@ -1009,7 +1110,7 @@ def chat_plus(body: ChatBody):
                 if txt:
                     by_page.setdefault(page, []).append(txt)
                 if meta.get("source"):
-                    sources.add(meta["source"])
+                    sources.add(meta.get("source"))
 
             excerpts = []
             for p in sorted(by_page.keys())[:5]:
