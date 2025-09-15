@@ -121,7 +121,7 @@ Beispiel 2
 Frage: Wie hoch war der Auftragseingang 2024 bei Siemens?
 Cypher:
 MATCH (k:Periodenkennzahl)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr),
-      (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
+      (k)-[:hatFinanzkennzahl]-(u:Konzernmutter)
 WHERE u.uri ENDS WITH '/Siemens_AG'
   AND p.uri ENDS WITH '#2024'
   AND k.uri ENDS WITH '/Auftragseingang'
@@ -131,7 +131,7 @@ Beispiel 2b
 Frage: Wie hoch waren die Umsatzerlöse 2023 bei Siemens?
 Cypher:
 MATCH (k:Periodenkennzahl|Erfolgskennzahl)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr),
-      (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->(u:Konzernmutter)
+      (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(u:Konzernmutter)
 WHERE u.uri ENDS WITH '/Siemens_AG'
   AND (p.uri ENDS WITH '#2023' OR p.uri ENDS WITH '/2023' OR toLower(k.uri) CONTAINS '_2023')
   AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
@@ -142,7 +142,7 @@ Frage: Was kannst du mir zur Berliner Vermögensverwaltung GmbH sagen?
 Cypher:
 MATCH (n:Tochterunternehmen|Assoziierte_Gemeinschafts_Unternehmen|Sonstige_Beteiligungen)
 WHERE n.uri ENDS WITH '/berliner_vermögensverwaltung_gmbh'
-OPTIONAL MATCH (n)-[:istTochterVon|:hatKonzernmutter]->(m:Konzernmutter)
+OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
 RETURN n.uri AS uri, n.anteilProzent[0] AS wert, n.Kommentar AS kommentar, labels(n) AS labels, m.uri AS konzern;
 """
 
@@ -258,7 +258,7 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
         fixed = expand_metric_labels(fixed)
     fixed = expand_holdings(fixed)
 
-    # Firmen-Relation robust (regex)
+    # Firmen-Relation robust (Regex: ersetze alleinstehendes hatFinanzkennzahl zu OR)
     fixed = re.sub(r"\[\s*:\s*hatfinanzkennzahl\s*\]",
                    "[:beziehtSichAufUnternehmen|hatFinanzkennzahl]", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"(\[\s*:[^\]]*?)\bhatfinanzkennzahl\b",
@@ -287,16 +287,16 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bAS\s+(kennzahl|id|node|knoten)\b", "AS uri", fixed, flags=re.IGNORECASE)
 
-    # Beziehungstyp-Alternativen: nach dem ersten Typ KEIN weiterer Doppelpunkt
-fixed = re.sub(r"\|\s*:", "|", fixed)
+    # Beziehungstyp-Alternativen: nach dem ersten Typ KEIN weiterer Doppelpunkt (aus ':A|:B' → ':A|B')
+    fixed = re.sub(r"\|\s*:", "|", fixed)
 
-# Firmenbeziehung ungerichtet machen (egal ob -> oder <-)
-fixed = re.sub(
-    r"-\s*\[\s*:\s*(?:beziehtSichAufUnternehmen|hatFinanzkennzahl)(?:\s*\|\s*(?:beziehtSichAufUnternehmen|hatFinanzkennzahl))*\s*\]\s*(?:->|<-)",
-    "-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-",
-    fixed,
-    flags=re.IGNORECASE
-)
+    # Firmenbeziehung ungerichtet machen (egal ob -> oder <-)
+    fixed = re.sub(
+        r"-\s*\[\s*:\s*(?:beziehtSichAufUnternehmen|hatFinanzkennzahl)(?:\s*\|\s*(?:beziehtSichAufUnternehmen|hatFinanzkennzahl))*\s*\]\s*(?:->|<-)",
+        "-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-",
+        fixed,
+        flags=re.IGNORECASE
+    )
 
     return fixed
 
@@ -773,8 +773,7 @@ def chat_plus(body: ChatBody):
                     "y2": f"#{year}",
                 }
                 cypher_exec = """
-                MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
-                      (:Konzernmutter {uri:$siemens})
+                MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
                 MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
                 WHERE (p.uri ENDS WITH $y1 OR p.uri ENDS WITH $y2)
                   AND k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
@@ -834,8 +833,7 @@ def chat_plus(body: ChatBody):
                 year = my["year"]
                 cypher_exec = f"""
                 MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-                OPTIONAL MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
-                               (u:Konzernmutter)
+                OPTIONAL MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(u:Konzernmutter)
                 WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
                        OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
                   AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
@@ -897,8 +895,7 @@ def chat_plus(body: ChatBody):
             OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]-(gb:Geschaeftsbereiche)
             WITH k, seg_tail, segUri, gb
             WHERE (gb.uri = segUri) OR toLower(k.uri) CONTAINS seg_tail
-            MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]->
-                  (:Konzernmutter {uri:$siemens})
+            MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
             OPTIONAL MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
             WITH k, p, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert,
                  CASE WHEN p IS NULL THEN NULL ELSE toInteger(right(p.uri,4)) END AS jahr
@@ -922,37 +919,36 @@ def chat_plus(body: ChatBody):
                     "answer": f"Umsatzerlöse ({short_name(params['seg'])}) {yr}: {de_format_number(r.get('wert'))} EUR"
                 }
 
+    # ---- Fallback: Umsatz ohne Jahr → jüngste Periode
     if not rows and _want_revenue(question) and not force_pdf:
-    params = {
-        "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
-    }
-    cypher_exec = """
-    MATCH (k)-[:beziehtSichAufUnternehmen|:hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
-    MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-    WHERE k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
-      AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
-    OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
-    OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
-    WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert
-    WITH k,p,gb,e,wert, toInteger(right(p.uri,4)) AS jahr
-    ORDER BY jahr DESC
-    RETURN k.uri AS uri, wert, p.uri AS periode, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
-    LIMIT 50
-    """
-    rows = graph.query(cypher_exec, params=params)
-    if rows:
-        # jüngstes Jahr bestimmen
-        latest_year = max([int(r["periode"][-4:]) for r in rows if r.get("periode")])
-        latest = [r for r in rows if str(latest_year) in (r.get("periode") or "")]
-        # Total bevorzugen; sonst einfach der erste
-        total = next((r for r in latest if r.get("gruppe") == "/Total"), None) or latest[0]
-        return {
-            "mode": "answer",
-            "cypher": "(fallback: Umsatz ohne Jahr)",
-            "cypher_executed": cypher_exec,
-            "rows": latest,
-            "answer": f"Umsatzerlöse {latest_year}: {de_format_number(total['wert'])} {short_name(total.get('einheit')) or ''}"
+        params = {
+            "siemens": "http://www.semanticweb.org/panthers/ontologies/2025/1-Entwurf/Siemens_AG"
         }
+        cypher_exec = """
+        MATCH (k)-[:beziehtSichAufUnternehmen|hatFinanzkennzahl]-(:Konzernmutter {uri:$siemens})
+        MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+        WHERE k.KennzahlWert IS NOT NULL AND k.KennzahlWert <> []
+          AND (toLower(k.uri) CONTAINS 'umsatzerlöse' OR toLower(k.uri) CONTAINS 'umsatz')
+        OPTIONAL MATCH (k)-[:segmentiertNachGeschaeftsbereich]->(gb:Geschaeftsbereiche)
+        OPTIONAL MATCH (k)-[:ausgedruecktInEinheit]->(e:Einheit)
+        WITH k,p,gb,e, coalesce(k.KennzahlWert[0],k.KennzahlWert) AS wert
+        WITH k,p,gb,e,wert, toInteger(right(p.uri,4)) AS jahr
+        ORDER BY jahr DESC
+        RETURN k.uri AS uri, wert, p.uri AS periode, coalesce(gb.uri,'/Total') AS gruppe, coalesce(e.uri,'/EUR') AS einheit
+        LIMIT 50
+        """
+        rows = graph.query(cypher_exec, params=params)
+        if rows:
+            latest_year = max([int(r["periode"][-4:]) for r in rows if r.get("periode")])
+            latest = [r for r in rows if str(latest_year) in (r.get("periode") or "")]
+            total = next((r for r in latest if r.get("gruppe") == "/Total"), None) or latest[0]
+            return {
+                "mode": "answer",
+                "cypher": "(fallback: Umsatz ohne Jahr)",
+                "cypher_executed": cypher_exec,
+                "rows": latest,
+                "answer": f"Umsatzerlöse {latest_year}: {de_format_number(total['wert'])} {short_name(total.get('einheit')) or ''}"
+            }
 
     # -------- Graph (LLM-Cypher)
     if not force_pdf:
