@@ -996,9 +996,6 @@ def chat_plus(body: ChatBody):
         LIMIT 100
         """
         all_rows = graph.query(cypher_exec, params=params)
-        Hier ist der **fehlende Rest** deiner `main2.py` ab der Stelle `if all_rows:` — inkl. LLM-Fallback und finalem RAG-Fallback. Füge diesen Block direkt an deine Datei an:
-
-```python
         if all_rows:
             # jüngste zwei Jahre extrahieren
             years = sorted({r["jahr"] for r in all_rows if r.get("jahr")}, reverse=True)[:2]
