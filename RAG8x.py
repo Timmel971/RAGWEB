@@ -89,18 +89,6 @@ def _run_cypher(q: str, params=None, tag: str = ""):
     print(f"[Cypher][rows]={len(rows)}\n")
     return rows
 
-# --- Beispiele, wo vorher graph.query(...) stand ---
-
-# 1) Deterministischer Pfad (ohne params)
-rows = _run_cypher(cypher_exec, tag="deterministisch")
-
-# 2) LLM-/Disambiguation-Pfad (mit params)
-rows = _run_cypher(
-    cq,
-    params={"holding": HOLDING_LABELS, "needle": question},
-    tag="disambiguation",
-)
-
 # Schema (optional)
 try:
     schema_text = graph.schema
