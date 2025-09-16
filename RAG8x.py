@@ -715,16 +715,20 @@ def chat_plus(body: ChatBody):
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
-            tail = my["tail"]
+            # Tail robust normalisieren (ohne führenden '/', als Slug für CONTAINS)
+            tail_raw = my["tail"]                  # z. B. "/Umsatzerlöse"
+            tail_norm = tail_raw.lstrip("/")       # "Umsatzerlöse"
+            tail_slug = tail_norm.replace(" ", "_")  # "Umsatzerlöse" -> "Umsatzerlöse" (evtl. mit _)
             year = my["year"]
-            # Breiter Kennzahl-Label-Match + Jahr robust über p.uri ODER k.uri (_YYYY)
+
             cypher_exec = f"""
             MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
             OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
             WHERE ANY(l IN labels(k) WHERE l IN $ml)
               AND (
-                    toLower(k.uri) ENDS WITH toLower('{tail}')
-                 OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}')
+                    toLower(k.uri) ENDS WITH toLower('/{tail_slug}')
+                 OR toLower(k.uri) ENDS WITH toLower('{tail_slug}')
+                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug}')
               )
               AND (
                     p.uri ENDS WITH '#{year}'
@@ -755,6 +759,7 @@ def chat_plus(body: ChatBody):
                         "uri": uri,
                         "label": prettify_tail(uri),
                         "wert": r.get("wert"),
+                        "wert_fmt": de_format_number(r.get("wert")) if r.get("wert") is not None else None,
                     })
                 return {
                     "mode": "clarify",
@@ -921,7 +926,7 @@ def chat_plus(body: ChatBody):
                 }
 
     # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
-    should_use_rag = force_pdf or (not rows and not force_graph)
+    should_use_rag = force_pdf or (not rows and not force_graph)  # <- immer auf RAG zurückfallen, wenn Graph leer
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
