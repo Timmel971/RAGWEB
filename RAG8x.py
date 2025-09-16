@@ -232,7 +232,6 @@ def expand_uri_endswiths(cypher: str) -> str:
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
-            # KORREKTE Variante (die mit den Klammern passt):
             cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
@@ -711,18 +710,26 @@ def chat_plus(body: ChatBody):
         if my:
             tail = my["tail"]
             year = my["year"]
+            # Breiter Kennzahl-Label-Match + Jahr robust über p.uri ODER k.uri (_YYYY)
             cypher_exec = f"""
             MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
             OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
-            WHERE (toLower(k.uri) ENDS WITH toLower('{tail}')
-                   OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}'))
-              AND (p.uri ENDS WITH '#{year}' OR p.uri ENDS WITH '/{year}')
+            WHERE ANY(l IN labels(k) WHERE l IN $ml)
+              AND (
+                    toLower(k.uri) ENDS WITH toLower('{tail}')
+                 OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}')
+              )
+              AND (
+                    p.uri ENDS WITH '#{year}'
+                 OR p.uri ENDS WITH '/{year}'
+                 OR toLower(k.uri) CONTAINS '_{year}'
+              )
             RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
             ORDER BY uri
             LIMIT 1
             """.strip()
             try:
-                rows = _run_cypher(cypher_exec, tag="deterministisch")
+                rows = _run_cypher(cypher_exec, params={"ml": METRIC_LABELS}, tag="deterministisch")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
