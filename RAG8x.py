@@ -878,7 +878,7 @@ def chat_plus(body: ChatBody):
                     }
 
         # Kennzahlen-Disambiguation (eingrenzen, falls Frage eine Zielkennzahl nennt)
-        if len(rows) > 1 and not is_company_question(question)):
+        if len(rows) > 1 and not is_company_question(question):
             ql = (question or "").lower()
             want_umsa = ("umsatzerlöse" in ql) or ("umsatzerloese" in ql)
             want_oi   = ("auftragseingang" in ql)
