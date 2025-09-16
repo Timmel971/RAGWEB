@@ -733,252 +733,250 @@ def chat_plus(body: ChatBody):
     rows: List[Dict[str, Any]] = []
     handled = False
 
-# ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
-if not force_pdf:
-    my = parse_metric_year_question(question)
-    if my:
-        # Tail robust normalisieren (ohne führenden '/', mit Umlaut-Variante)
-        tail_raw = my["tail"]                   # z. B. "/Umsatzerlöse"
-        tail_norm = tail_raw.lstrip("/")        # "Umsatzerlöse"
-        tail_slug = _slugify_metric_token(tail_norm)
-        tail_slug_oe = _slug_oe(tail_slug)
-        year = my["year"]
-
-        cypher_exec = f"""
-        MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
-        OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
-        WHERE ANY(l IN labels(k) WHERE l IN $ml)
-          AND (
-                toLower(k.uri) ENDS WITH toLower('/{tail_slug}')
-             OR toLower(k.uri) ENDS WITH toLower('{tail_slug}')
-             OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug}')
-             OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug_oe}')
-          )
-          AND (
-                p.uri ENDS WITH '#{year}'
-             OR p.uri ENDS WITH '/{year}'
-             OR toLower(k.uri) CONTAINS '_{year}'
-          )
-        RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
-        ORDER BY toLower(uri)
-        LIMIT 50
-        """.strip()
-
-        try:
-            rows = _run_cypher(
-                cypher_exec,
-                params={"ml": METRIC_LABELS},
-                tag="deterministisch",
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
-
-        # Mehrtreffer -> Clarify-Auswahl (hart auf Umsatzerlöse filtern)
-        if len(rows) > 1:
-            filtered = [r for r in rows if _uri_contains_metric(r.get("uri", ""), tail_slug)]
-            show = filtered if filtered else rows
-            options = []
-            for r in show[:20]:
-                uri = r.get("uri")
-                if not uri:
-                    continue
-                options.append({
-                    "uri": uri,
-                    "label": prettify_tail(uri),
-                    "wert": r.get("wert"),
-                    "wert_fmt": de_format_number(r.get("wert")) if r.get("wert") is not None else None,
-                })
-            handled = True
-            print(f"[Clarify][deterministic] options={len(options)} rows_total={len(rows)} metric={tail_slug}")
-            return {
-                "mode": "clarify",
-                "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                "options": options,
-                "cypher_tried": cypher_exec,
-                "row_count": len(rows),
-            }
-
-        # Single-Hit -> hübsch ausformulieren
-        if rows:
-            r0 = rows[0]
-            uri = r0.get("uri")
-            if uri:
-                try:
-                    det = value_by_uri(uri)
-                    if det["kind"] == "metric":
-                        value = det.get("wert")
-                        year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
-                        einheit = short_name(det.get("einheit")) or ""
-                        std = std_short(det.get("standard")) or "IFRS/HGB"
-                        val_txt = de_format_number(value)
-                        label = det["label"]
-                        text = (
-                            f'Die Kennzahl "{label}" wird nach {std} ermittelt und '
-                            f'belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
-                        )
-                        handled = True
-                        print("[Answer][deterministic] pretty metric answer")
-                        return {
-                            "mode": "answer",
-                            "cypher": "(deterministisch)",
-                            "cypher_executed": cypher_exec,
-                            "rows": rows,
-                            "row_count": len(rows),
-                            "answer": text,
-                        }
-                except Exception:
-                    pass
-
-            # Fallback: Wert-only
-            if "wert" in r0 and r0["wert"] is not None:
-                handled = True
-                print("[Answer][deterministic] value-only fallback")
-                return {
-                    "mode": "answer",
-                    "cypher": "(deterministisch)",
-                    "cypher_executed": cypher_exec,
-                    "rows": rows,
-                    "row_count": len(rows),
-                    "answer": f"Ergebnis: {de_format_number(r0['wert'])}",
-                }
-
-# Debug (optional)
-print(f"[Flow] after deterministic: handled={handled}, rows={len(rows) if rows is not None else 'None'}")
-
-# -------- Graph (LLM-Cypher), wenn nicht "pdf only" UND noch nicht handled
-if not force_pdf and not handled:
-    cypher_in = cypher_prompt.format(
-        history=history_text or "(kein Verlauf)",
-        schema=schema_text,
-        labels_allow=", ".join(LABELS_ALLOW),
-        rels_allow=", ".join(RELS_ALLOW),
-        fewshots=FEWSHOTS,
-        question=question
-    )
-    cypher_raw = llm.invoke(cypher_in).content.strip().strip("`")
-    cypher_exec = sanitize_and_fix(cypher_raw, question)
-    try:
-        rows = _run_cypher(cypher_exec, tag="llm")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
-
-
-
-    # ---- Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
+    # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
     if not force_pdf:
-        # Disambiguation: Firmen
-        if (len(rows) > 1 or (not rows and is_company_question(question))):
-            if is_company_question(question):
-                cq = """
-                MATCH (n)
-                WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
-                WITH n, toLower(n.uri) AS u
-                WHERE u CONTAINS toLower($needle)
-                OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
-                RETURN n.uri AS uri, m.uri AS konzern
-                ORDER BY uri
-                LIMIT 8
-                """
-                cands = _run_cypher(cq, params={"holding": HOLDING_LABELS, "needle": question}, tag="disambiguation")
-                if cands:
-                    options = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in cands]
-                    return {
-                        "mode": "clarify",
-                        "question": "Ich habe mehrere passende Unternehmen gefunden. Welches meinst du?",
-                        "options": options,
-                        "cypher_tried": cypher_exec
-                    }
+        my = parse_metric_year_question(question)
+        if my:
+            # Tail robust normalisieren (ohne führenden '/', mit Umlaut-Variante)
+            tail_raw = my["tail"]                   # z. B. "/Umsatzerlöse"
+            tail_norm = tail_raw.lstrip("/")        # "Umsatzerlöse"
+            tail_slug = _slugify_metric_token(tail_norm)
+            tail_slug_oe = _slug_oe(tail_slug)
+            year = my["year"]
 
-        # Kennzahlen-Disambiguation (eingrenzen, falls Frage eine Zielkennzahl nennt)
-        if len(rows) > 1 and not is_company_question(question):
-            ql = (question or "").lower()
-            want_umsa = ("umsatzerlöse" in ql) or ("umsatzerloese" in ql)
-            want_oi   = ("auftragseingang" in ql)
+            cypher_exec = f"""
+            MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
+            OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
+            WHERE ANY(l IN labels(k) WHERE l IN $ml)
+              AND (
+                    toLower(k.uri) ENDS WITH toLower('/{tail_slug}')
+                 OR toLower(k.uri) ENDS WITH toLower('{tail_slug}')
+                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug}')
+                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug_oe}')
+              )
+              AND (
+                    p.uri ENDS WITH '#{year}'
+                 OR p.uri ENDS WITH '/{year}'
+                 OR toLower(k.uri) CONTAINS '_{year}'
+              )
+            RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
+            ORDER BY toLower(uri)
+            LIMIT 50
+            """.strip()
 
-            show_rows = rows
-            if want_umsa:
-                show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "umsatzerlöse")]
-            elif want_oi:
-                show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "auftragseingang")]
+            try:
+                rows = _run_cypher(
+                    cypher_exec,
+                    params={"ml": METRIC_LABELS},
+                    tag="deterministisch",
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-            if not show_rows:
-                show_rows = rows
-
-            opts = []
-            for r in show_rows[:20]:
-                uri = r.get("uri")
-                if uri:
-                    opts.append({
+            # Mehrtreffer -> Clarify-Auswahl (hart auf Umsatzerlöse filtern)
+            if len(rows) > 1:
+                filtered = [r for r in rows if _uri_contains_metric(r.get("uri", ""), tail_slug)]
+                show = filtered if filtered else rows
+                options = []
+                for r in show[:20]:
+                    uri = r.get("uri")
+                    if not uri:
+                        continue
+                    options.append({
                         "uri": uri,
                         "label": prettify_tail(uri),
                         "wert": r.get("wert"),
                         "wert_fmt": de_format_number(r.get("wert")) if r.get("wert") is not None else None,
                     })
-            if opts:
+                handled = True
+                print(f"[Clarify][deterministic] options={len(options)} rows_total={len(rows)} metric={tail_slug}")
                 return {
                     "mode": "clarify",
                     "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                    "options": opts,
-                    "cypher_tried": cypher_exec
-                }
-
-        # Formatierte Antworten
-        if rows:
-            r0 = rows[0]
-            uri = r0.get("uri")
-            if uri:
-                try:
-                    det = value_by_uri(uri)
-                    if det["kind"] == "company":
-                        anteil = det.get("wert")
-                        anteil_txt = f"{de_format_number(anteil)} %" if anteil is not None else "100 %"
-                        konzern_txt = short_name(det.get("konzern")) or "die Konzernmutter"
-                        sitz = ""
-                        if det.get("stadt") or det.get("land"):
-                            city = short_name(det.get("stadt")) or "?"
-                            country = short_name(det.get("land")) or "?"
-                            sitz = f"\nSitz: {city}, {country}"
-                        kommentar = det.get("kommentar")
-                        kmt = f"\nKommentar: {kommentar}" if kommentar else ""
-                        text = f"Die {konzern_txt} hält {anteil_txt} an {det['label']}.{sitz}{kmt}"
-                        return {
-                            "mode": "answer",
-                            "cypher": cypher_raw,
-                            "cypher_executed": cypher_exec,
-                            "rows": rows,
-                            "row_count": len(rows),
-                            "answer": text
-                        }
-                    elif det["kind"] == "metric":
-                        value = det.get("wert")
-                        year = short_name(det.get("periode"))
-                        year = year.split("#")[-1] if year else "?"
-                        einheit = short_name(det.get("einheit")) or ""
-                        std = std_short(det.get("standard")) or "IFRS/HGB"
-                        val_txt = de_format_number(value)
-                        label = det["label"]
-                        text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year} auf {val_txt} {einheit}.'
-                        return {
-                            "mode": "answer",
-                            "cypher": cypher_raw,
-                            "cypher_executed": cypher_exec,
-                            "rows": rows,
-                            "row_count": len(rows),
-                            "answer": text
-                        }
-                except Exception:
-                    pass
-
-            # Fallback: Wert-only
-            if "wert" in r0 and r0["wert"] is not None:
-                return {
-                    "mode": "answer",
-                    "cypher": cypher_raw,
-                    "cypher_executed": cypher_exec,
-                    "rows": rows,
+                    "options": options,
+                    "cypher_tried": cypher_exec,
                     "row_count": len(rows),
-                    "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                 }
+
+            # Single-Hit -> hübsch ausformulieren
+            if rows:
+                r0 = rows[0]
+                uri = r0.get("uri")
+                if uri:
+                    try:
+                        det = value_by_uri(uri)
+                        if det["kind"] == "metric":
+                            value = det.get("wert")
+                            year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
+                            einheit = short_name(det.get("einheit")) or ""
+                            std = std_short(det.get("standard")) or "IFRS/HGB"
+                            val_txt = de_format_number(value)
+                            label = det["label"]
+                            text = (
+                                f'Die Kennzahl "{label}" wird nach {std} ermittelt und '
+                                f'belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
+                            )
+                            handled = True
+                            print("[Answer][deterministic] pretty metric answer")
+                            return {
+                                "mode": "answer",
+                                "cypher": "(deterministisch)",
+                                "cypher_executed": cypher_exec,
+                                "rows": rows,
+                                "row_count": len(rows),
+                                "answer": text,
+                            }
+                    except Exception:
+                        pass
+
+                # Fallback: Wert-only
+                if "wert" in r0 and r0["wert"] is not None:
+                    handled = True
+                    print("[Answer][deterministic] value-only fallback")
+                    return {
+                        "mode": "answer",
+                        "cypher": "(deterministisch)",
+                        "cypher_executed": cypher_exec,
+                        "rows": rows,
+                        "row_count": len(rows),
+                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}",
+                    }
+
+    # Debug (optional)
+    print(f"[Flow] after deterministic: handled={handled}, rows={len(rows) if rows is not None else 'None'}")
+
+    # -------- Graph (LLM-Cypher), wenn nicht "pdf only" UND noch nicht handled
+    if not force_pdf and not handled:
+        cypher_in = cypher_prompt.format(
+            history=history_text or "(kein Verlauf)",
+            schema=schema_text,
+            labels_allow=", ".join(LABELS_ALLOW),
+            rels_allow=", ".join(RELS_ALLOW),
+            fewshots=FEWSHOTS,
+            question=question
+        )
+        cypher_raw = llm.invoke(cypher_in).content.strip().strip("`")
+        cypher_exec = sanitize_and_fix(cypher_raw, question)
+        try:
+            rows = _run_cypher(cypher_exec, tag="llm")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+
+        # ---- Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
+        if not force_pdf:
+            # Disambiguation: Firmen
+            if (len(rows) > 1 or (not rows and is_company_question(question))):
+                if is_company_question(question):
+                    cq = """
+                    MATCH (n)
+                    WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
+                    WITH n, toLower(n.uri) AS u
+                    WHERE u CONTAINS toLower($needle)
+                    OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
+                    RETURN n.uri AS uri, m.uri AS konzern
+                    ORDER BY uri
+                    LIMIT 8
+                    """
+                    cands = _run_cypher(cq, params={"holding": HOLDING_LABELS, "needle": question}, tag="disambiguation")
+                    if cands:
+                        options = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in cands]
+                        return {
+                            "mode": "clarify",
+                            "question": "Ich habe mehrere passende Unternehmen gefunden. Welches meinst du?",
+                            "options": options,
+                            "cypher_tried": cypher_exec
+                        }
+
+            # Kennzahlen-Disambiguation (eingrenzen, falls Frage eine Zielkennzahl nennt)
+            if len(rows) > 1 and not is_company_question(question):
+                ql = (question or "").lower()
+                want_umsa = ("umsatzerlöse" in ql) or ("umsatzerloese" in ql)
+                want_oi   = ("auftragseingang" in ql)
+
+                show_rows = rows
+                if want_umsa:
+                    show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "umsatzerlöse")]
+                elif want_oi:
+                    show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "auftragseingang")]
+
+                if not show_rows:
+                    show_rows = rows
+
+                opts = []
+                for r in show_rows[:20]:
+                    uri = r.get("uri")
+                    if uri:
+                        opts.append({
+                            "uri": uri,
+                            "label": prettify_tail(uri),
+                            "wert": r.get("wert"),
+                            "wert_fmt": de_format_number(r.get("wert")) if r.get("wert") is not None else None,
+                        })
+                if opts:
+                    return {
+                        "mode": "clarify",
+                        "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
+                        "options": opts,
+                        "cypher_tried": cypher_exec
+                    }
+
+            # Formatierte Antworten
+            if rows:
+                r0 = rows[0]
+                uri = r0.get("uri")
+                if uri:
+                    try:
+                        det = value_by_uri(uri)
+                        if det["kind"] == "company":
+                            anteil = det.get("wert")
+                            anteil_txt = f"{de_format_number(anteil)} %" if anteil is not None else "100 %"
+                            konzern_txt = short_name(det.get("konzern")) or "die Konzernmutter"
+                            sitz = ""
+                            if det.get("stadt") or det.get("land"):
+                                city = short_name(det.get("stadt")) or "?"
+                                country = short_name(det.get("land")) or "?"
+                                sitz = f"\nSitz: {city}, {country}"
+                            kommentar = det.get("kommentar")
+                            kmt = f"\nKommentar: {kommentar}" if kommentar else ""
+                            text = f"Die {konzern_txt} hält {anteil_txt} an {det['label']}.{sitz}{kmt}"
+                            return {
+                                "mode": "answer",
+                                "cypher": cypher_raw,
+                                "cypher_executed": cypher_exec,
+                                "rows": rows,
+                                "row_count": len(rows),
+                                "answer": text
+                            }
+                        elif det["kind"] == "metric":
+                            value = det.get("wert")
+                            year = short_name(det.get("periode"))
+                            year = year.split("#")[-1] if year else "?"
+                            einheit = short_name(det.get("einheit")) or ""
+                            std = std_short(det.get("standard")) or "IFRS/HGB"
+                            val_txt = de_format_number(value)
+                            label = det["label"]
+                            text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year} auf {val_txt} {einheit}.'
+                            return {
+                                "mode": "answer",
+                                "cypher": cypher_raw,
+                                "cypher_executed": cypher_exec,
+                                "rows": rows,
+                                "row_count": len(rows),
+                                "answer": text
+                            }
+                    except Exception:
+                        pass
+
+                # Fallback: Wert-only
+                if "wert" in r0 and r0["wert"] is not None:
+                    return {
+                        "mode": "answer",
+                        "cypher": cypher_raw,
+                        "cypher_executed": cypher_exec,
+                        "rows": rows,
+                        "row_count": len(rows),
+                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
+                    }
 
     # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
     should_use_rag = force_pdf or (not rows and not force_graph)  # immer auf RAG zurückfallen, wenn Graph leer
