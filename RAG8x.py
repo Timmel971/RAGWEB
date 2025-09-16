@@ -740,8 +740,8 @@ if not force_pdf:
         # Tail robust normalisieren (ohne führenden '/', mit Umlaut-Variante)
         tail_raw = my["tail"]                   # z. B. "/Umsatzerlöse"
         tail_norm = tail_raw.lstrip("/")        # "Umsatzerlöse"
-        tail_slug = _slugify_metric_token(tail_norm)    # "Umsatzerlöse" -> "Umsatzerlöse"
-        tail_slug_oe = _slug_oe(tail_slug)              # "Umsatzerlöse" -> "Umsatzerloese"
+        tail_slug = _slugify_metric_token(tail_norm)
+        tail_slug_oe = _slug_oe(tail_slug)
         year = my["year"]
 
         cypher_exec = f"""
@@ -842,7 +842,7 @@ if not force_pdf:
                     "answer": f"Ergebnis: {de_format_number(r0['wert'])}",
                 }
 
-# Debug: zeigen, ob der deterministische Pfad schon gegriffen hat
+# Debug (optional)
 print(f"[Flow] after deterministic: handled={handled}, rows={len(rows) if rows is not None else 'None'}")
 
 # -------- Graph (LLM-Cypher), wenn nicht "pdf only" UND noch nicht handled
@@ -861,6 +861,7 @@ if not force_pdf and not handled:
         rows = _run_cypher(cypher_exec, tag="llm")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
+
 
 
     # ---- Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
