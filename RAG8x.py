@@ -921,7 +921,7 @@ def chat_plus(body: ChatBody):
                 }
 
     # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
-    should_use_rag = force_pdf or (not rows and not force_graph and not is_company_question(question))
+    should_use_rag = force_pdf or (not rows and not force_graph)
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
