@@ -212,9 +212,16 @@ def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
-
+    
 def expand_metric_labels(cypher: str) -> str:
-    return cypher.replace(":Periodenkennzahl", ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl")
+    # Ersetze jedes einzelne Kennzahl-Label durch die Union aller vier
+    union = ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl"
+    return re.sub(
+        r":\s*(Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl)\b",
+        union,
+        cypher,
+        flags=re.IGNORECASE
+    )
 
 def expand_uri_endswiths(cypher: str) -> str:
     def repl(m: re.Match) -> str:
