@@ -212,16 +212,9 @@ def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
-    
+
 def expand_metric_labels(cypher: str) -> str:
-    # Ersetze jedes einzelne Kennzahl-Label durch die Union aller vier
-    union = ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl"
-    return re.sub(
-        r":\s*(Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl)\b",
-        union,
-        cypher,
-        flags=re.IGNORECASE
-    )
+    return cypher.replace(":Periodenkennzahl", ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl")
 
 def expand_uri_endswiths(cypher: str) -> str:
     def repl(m: re.Match) -> str:
@@ -732,39 +725,14 @@ def chat_plus(body: ChatBody):
                  OR toLower(k.uri) CONTAINS '_{year}'
               )
             RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
-            ORDER BY toLower(uri)
-            LIMIT 50
+            ORDER BY uri
+            LIMIT 1
             """.strip()
             try:
-                rows = _run_cypher(
-                    cypher_exec,
-                    params={"ml": METRIC_LABELS},
-                    tag="deterministisch",
-                )
+                rows = _run_cypher(cypher_exec, params={"ml": METRIC_LABELS}, tag="deterministisch")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-            # Mehrtreffer -> Clarify-Auswahl
-            if len(rows) > 1:
-                options = []
-                for r in rows[:20]:
-                    uri = r.get("uri")
-                    if not uri:
-                        continue
-                    options.append({
-                        "uri": uri,
-                        "label": prettify_tail(uri),
-                        "wert": r.get("wert"),
-                    })
-                return {
-                    "mode": "clarify",
-                    "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                    "options": options,
-                    "cypher_tried": cypher_exec,
-                    "row_count": len(rows),
-                }
-
-            # Single-Hit -> hübsch ausformulieren
             if rows:
                 r0 = rows[0]
                 uri = r0.get("uri")
@@ -778,22 +746,17 @@ def chat_plus(body: ChatBody):
                             std = std_short(det.get("standard")) or "IFRS/HGB"
                             val_txt = de_format_number(value)
                             label = det["label"]
-                            text = (
-                                f'Die Kennzahl "{label}" wird nach {std} ermittelt und '
-                                f'belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
-                            )
+                            text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
                             return {
                                 "mode": "answer",
                                 "cypher": "(deterministisch)",
                                 "cypher_executed": cypher_exec,
                                 "rows": rows,
                                 "row_count": len(rows),
-                                "answer": text,
+                                "answer": text
                             }
                     except Exception:
                         pass
-
-                # Fallback: Wert-only
                 if "wert" in r0 and r0["wert"] is not None:
                     return {
                         "mode": "answer",
@@ -801,9 +764,9 @@ def chat_plus(body: ChatBody):
                         "cypher_executed": cypher_exec,
                         "rows": rows,
                         "row_count": len(rows),
-                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}",
+                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                     }
-    # wenn keine Rows -> normal weiter (LLM)
+            # wenn keine Rows → normal weiter
 
     # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
     if not force_pdf:
