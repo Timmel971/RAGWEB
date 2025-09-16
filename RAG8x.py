@@ -66,11 +66,39 @@ AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY ist nicht gesetzt (.env)")
 
-# Neo4j connect
+# --- Neo4j connect ---
 graph = (
-    Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASSWORD, database=NEO4J_DATABASE)
+    Neo4jGraph(
+        url=NEO4J_URI,
+        username=NEO4J_USER,
+        password=NEO4J_PASSWORD,
+        database=NEO4J_DATABASE,
+    )
     if NEO4J_DATABASE
-    else Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASSWORD)
+    else Neo4jGraph(
+        url=NEO4J_URI,
+        username=NEO4J_USER,
+        password=NEO4J_PASSWORD,
+    )
+)
+
+# --- Helper: Cypher mit Logging in Render-Logs ---
+def _run_cypher(q: str, params=None, tag: str = ""):
+    print(f"\n[Cypher]{' '+tag if tag else ''}\n{q}\nparams={params or {}}")
+    rows = graph.query(q, params=params)
+    print(f"[Cypher][rows]={len(rows)}\n")
+    return rows
+
+# --- Beispiele, wo vorher graph.query(...) stand ---
+
+# 1) Deterministischer Pfad (ohne params)
+rows = _run_cypher(cypher_exec, tag="deterministisch")
+
+# 2) LLM-/Disambiguation-Pfad (mit params)
+rows = _run_cypher(
+    cq,
+    params={"holding": HOLDING_LABELS, "needle": question},
+    tag="disambiguation",
 )
 
 # Schema (optional)
@@ -704,7 +732,7 @@ def chat_plus(body: ChatBody):
             LIMIT 1
             """.strip()
             try:
-                rows = graph.query(cypher_exec)
+                rows = _run_cypher(cypher_exec, tag="deterministisch")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
@@ -754,7 +782,7 @@ def chat_plus(body: ChatBody):
         cypher_raw = llm.invoke(cypher_in).content.strip().strip("`")
         cypher_exec = sanitize_and_fix(cypher_raw, question)
         try:
-            rows = graph.query(cypher_exec)
+            rows = _run_cypher(cypher_exec, tag="deterministisch")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
