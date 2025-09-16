@@ -565,7 +565,7 @@ def _history_text(msgs: List[Message]) -> str:
 @app.get("/list")
 def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = "", limit: int = 5000):
     if kind == "company":
-        rows = graph.query(
+        rows = _run_cypher(
             """
             MATCH (n)
             WHERE ('Konzernmutter' IN labels(n)) OR ANY(l IN labels(n) WHERE l IN $holding)
@@ -573,11 +573,12 @@ def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = ""
             ORDER BY toLower(n.uri)
             LIMIT $limit
             """,
-            params={"holding": HOLDING_LABELS, "limit": limit}
+            params={"holding": HOLDING_LABELS, "limit": limit},
+            tag="list:company",
         )
         items = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in rows]
     else:
-        rows = graph.query(
+        rows = _run_cypher(
             """
             MATCH (k)
             WHERE ANY(l IN labels(k) WHERE l IN $ml)
@@ -585,7 +586,8 @@ def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = ""
             ORDER BY toLower(k.uri)
             LIMIT $limit
             """,
-            params={"ml": METRIC_LABELS, "limit": limit}
+            params={"ml": METRIC_LABELS, "limit": limit},
+            tag="list:metric",
         )
         items = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in rows]
     if q:
@@ -596,7 +598,7 @@ def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = ""
 # ---- Detailauflösung ----
 @app.get("/valueByUri")
 def value_by_uri(uri: str = Query(..., description="Exakte URI eines Knotens (Kennzahl oder Unternehmen)")):
-    rows = graph.query("""
+    rows = _run_cypher("""
         MATCH (n {uri: $uri})
         WITH n, labels(n) AS labs
         OPTIONAL MATCH (n)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
@@ -615,7 +617,7 @@ def value_by_uri(uri: str = Query(..., description="Exakte URI eines Knotens (Ke
                l.uri AS land,
                n.Kommentar AS kommentar
         LIMIT 1
-    """, params={"uri": uri})
+    """, params={"uri": uri}, tag="valueByUri")
     if not rows:
         raise HTTPException(404, "Nicht gefunden")
     r = rows[0]
@@ -657,7 +659,7 @@ def graph_ego(uri: str, depth: int = 1, limit: int = 60):
       [r IN rels  | {{source: startNode(r).uri, target: endNode(r).uri, type: type(r)}}] AS edges
     LIMIT $limit
     """
-    rows = graph.query(q, params={"uri": uri, "limit": limit})
+    rows = _run_cypher(q, params={"uri": uri, "limit": limit}, tag="graph:ego")
     if not rows:
         raise HTTPException(404, "Kein Graph für diese URI gefunden.")
 
@@ -743,6 +745,7 @@ def chat_plus(body: ChatBody):
                                 "cypher": "(deterministisch)",
                                 "cypher_executed": cypher_exec,
                                 "rows": rows,
+                                "row_count": len(rows),
                                 "answer": text
                             }
                     except Exception:
@@ -753,6 +756,7 @@ def chat_plus(body: ChatBody):
                         "cypher": "(deterministisch)",
                         "cypher_executed": cypher_exec,
                         "rows": rows,
+                        "row_count": len(rows),
                         "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                     }
             # wenn keine Rows → normal weiter
@@ -770,7 +774,7 @@ def chat_plus(body: ChatBody):
         cypher_raw = llm.invoke(cypher_in).content.strip().strip("`")
         cypher_exec = sanitize_and_fix(cypher_raw, question)
         try:
-            rows = _run_cypher(cypher_exec, tag="deterministisch")
+            rows = _run_cypher(cypher_exec, tag="llm")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
@@ -789,7 +793,7 @@ def chat_plus(body: ChatBody):
                 ORDER BY uri
                 LIMIT 8
                 """
-                cands = graph.query(cq, params={"holding": HOLDING_LABELS, "needle": question})
+                cands = _run_cypher(cq, params={"holding": HOLDING_LABELS, "needle": question}, tag="disambiguation")
                 if cands:
                     options = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in cands]
                     return {
@@ -838,6 +842,7 @@ def chat_plus(body: ChatBody):
                             "cypher": cypher_raw,
                             "cypher_executed": cypher_exec,
                             "rows": rows,
+                            "row_count": len(rows),
                             "answer": text
                         }
                     elif det["kind"] == "metric":
@@ -854,6 +859,7 @@ def chat_plus(body: ChatBody):
                             "cypher": cypher_raw,
                             "cypher_executed": cypher_exec,
                             "rows": rows,
+                            "row_count": len(rows),
                             "answer": text
                         }
                 except Exception:
@@ -866,6 +872,7 @@ def chat_plus(body: ChatBody):
                     "cypher": cypher_raw,
                     "cypher_executed": cypher_exec,
                     "rows": rows,
+                    "row_count": len(rows),
                     "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
                 }
 
@@ -927,7 +934,7 @@ def chat_plus(body: ChatBody):
             by_page: Dict[int, List[str]] = {}
             sources = set()
             for c in ctx:
-                meta = c.get("meta") or {}
+                meta = (c.get("meta") or {})
                 page = meta.get("page")
                 if page is None:
                     continue
