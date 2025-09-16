@@ -1,10 +1,8 @@
-# main2_refactored.py
+# main2.py
 import os
 import re
 import tempfile
 import urllib.request
-from urllib.parse import unquote
-import unicodedata
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -28,7 +26,7 @@ from rank_bm25 import BM25Okapi
 # ==================== Setup ====================
 load_dotenv()
 
-app = FastAPI(title="Graph-QA (Neo4j) + RAG PDF – Multi-Turn + Disambiguation (Refactored)")
+app = FastAPI(title="Graph-QA (Neo4j) + RAG PDF – Multi-Turn + Disambiguation")
 
 # CORS – offen für Render + CodePen
 app.add_middleware(
@@ -54,14 +52,14 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE")  # optional
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Vektorstore
+# Vektorstore (lokal, wenn Render ohne Disk: ./chroma; mit Persistent Disk: /data/chroma)
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma")
 PDF_COLLECTION = os.getenv("PDF_COLLECTION", "siemens_2024")
 
-# Embeddings
+# Embeddings (achte auf EMBED_MODEL vs EMB_MODEL)
 EMBED_MODEL = os.getenv("EMBED_MODEL") or os.getenv("EMB_MODEL") or "text-embedding-3-small"
 
-# Auto-Index
+# Auto-Index: Lokaler Pfad oder Direkt-Download-URL (Drive: uc?export=download&id=…)
 AUTO_PDF_PATH = os.getenv("AUTO_PDF_PATH")
 AUTO_PDF_URL  = os.getenv("AUTO_PDF_URL")
 
@@ -84,7 +82,7 @@ graph = (
     )
 )
 
-# --- Helper: Cypher mit Logging ---
+# --- Helper: Cypher mit Logging in Render-Logs ---
 def _run_cypher(q: str, params=None, tag: str = ""):
     print(f"\n[Cypher]{' '+tag if tag else ''}\n{q}\nparams={params or {}}")
     rows = graph.query(q, params=params)
@@ -176,7 +174,7 @@ Regeln:
 - Node-Match via uri/… (ENDS WITH '/…' etc.)
 - Zahlenarrays immer [0] (z. B. KennzahlWert[0], anteilProzent[0])
 - **Immer** auch die `uri` der gefundenen Kennzahl/Unternehmens zurückgeben (`... AS uri`) – zusätzlich zu `wert` falls relevant.
-- Verzichte auf Heuristik `k.uri CONTAINS '_YYYY'` – nutze ausschließlich die Periode.
+- Liefere **nur** die Cypher-Query, ohne Markdown.
 
 {fewshots}
 Frage: {question}
@@ -190,64 +188,11 @@ cypher_prompt = PromptTemplate(
 # ================= Helpers =================
 
 def prettify_tail(uri: str) -> str:
-    tail = (uri or '').rsplit("/", 1)[-1]
+    tail = uri.rsplit("/", 1)[-1]
     return re.sub(r"\s+", " ", tail.replace("_"," ").replace("%20"," ")).strip()
 
-# ---- URI Normalisierung / Matching robust gegen Umlaute & Encoding ----
-def _norm(s: str) -> str:
-    return (s or "").lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss").strip()
-
-def _slugify_metric_token(s: str) -> str:
-    return (s or "").strip().replace(" ", "_")
-
-def _slug_oe(s: str) -> str:
-    return (s or "").replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")
-
-def _percent_encode_utf8(s: str) -> str:
-    try:
-        return ''.join([f'%{b:02X}' for b in s.encode('utf-8')])
-    except Exception:
-        return s
-
-def _norm_uri(u: str) -> str:
-    u = unquote(u or "")  # %C3%B6 -> ö
-    u = unicodedata.normalize("NFKC", u)
-    u = u.lower()
-    u = u.replace("-", "_").replace(".", "_").replace("/", "_")
-    return u
-
-# Kennzahl-Erkennung im URI nach Normalisierung
-def _uri_contains_metric(uri: str, metric_slug: str) -> bool:
-    u = _norm_uri(uri)
-    ms = _norm_uri(metric_slug)
-    ms_oe = _norm_uri(_slug_oe(metric_slug))
-    return (ms in u) or (ms_oe in u)
-
-# Frageparser (Umsatz, Auftragseingang + Jahr)
-METRIC_RE = re.compile(
-    r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
-    re.IGNORECASE
-)
-
-def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
-    m = METRIC_RE.search(q or "")
-    if not m:
-        return None
-    metric_raw = _norm(m.group(1))
-    year = m.group(3)
-    for key, tail in METRIC_ALIASES.items():
-        if _norm(key) in metric_raw:
-            return {"tail": tail, "year": year}
-    return None
-
-# Erkennung, ob Unternehmensfrage (beeinflusst Label-Expansion)
 def is_company_question(text: str) -> bool:
-    t = " " + (text or "").lower() + " "
-    segment_hints = [" segment", " geschaeftsbereich", " geschäftsbereich",
-                     " digital industries", " smart infrastructure",
-                     " mobility", " siemens healthineers"]
-    if any(h in t for h in segment_hints):
-        return False
+    t = " " + text.lower() + " "
     if "tochter" in t or "beteilig" in t:
         return True
     COMPANY_HINTS = [
@@ -256,8 +201,7 @@ def is_company_question(text: str) -> bool:
     ]
     return any(h in t for h in COMPANY_HINTS)
 
-# ---------- Cypher Sanitizer / Expander ----------
-
+# ---------- Cypher Sanitizer ----------
 def remove_generic_labels(cypher: str) -> str:
     cypher = re.sub(r":NamedIndividual\b", "", cypher)
     cypher = re.sub(r":Resource\b", "", cypher)
@@ -268,8 +212,9 @@ def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
-
+    
 def expand_metric_labels(cypher: str) -> str:
+    # Ersetze jedes einzelne Kennzahl-Label durch die Union aller vier
     union = ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl"
     return re.sub(
         r":\s*(Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl)\b",
@@ -291,29 +236,17 @@ def expand_uri_endswiths(cypher: str) -> str:
             tail.lower(),
             tail.lower().replace(" ","_").replace(".","_").replace("-","_")
         }
-        # Prozent-encodete Variante (UTF-8)
-        try:
-            pe = _percent_encode_utf8(tail)
-            bases.add(pe)
-            bases.add(pe.lower())
-        except Exception:
-            pass
         for t in bases:
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('/{t}')")
             cand.add(f"toLower({var}.uri) ENDS WITH toLower('{t}')")
-            cand.add(f"toLower(replace(replace(replace({var}.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{t}')")
+            cand.add(f"toLower(replace(replace({var}.uri,'-','_'),'.','_')) CONTAINS toLower('{t}')")
         return "(" + " OR ".join(sorted(cand)) + ")"
     pat = re.compile(r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\.uri\s+ENDS\s+WITH\s+'(?P<lit>[^']+)'", re.IGNORECASE)
     return pat.sub(repl, cypher)
 
 def expand_year_filters(cypher: str) -> str:
-    # Entferne die schwache Heuristik auf k.uri CONTAINS '_YYYY' – nur Periode verwenden
-    def repl(m: re.Match) -> str:
-        y = m.group(2)
-        return f"(p.uri ENDS WITH '#{y}' OR p.uri ENDS WITH '/{y}')"
-    cypher = re.sub(r"p\.uri\s*ENDS\s*WITH\s*'#(\d{4})'", lambda m: f"(p.uri ENDS WITH '#{m.group(1)}' OR p.uri ENDS WITH '/{m.group(1)}')", cypher, flags=re.IGNORECASE)
-    cypher = re.sub(r"\(\s*p\.uri\s*ENDS\s*WITH\s*'#(\d{4})'\s*OR[^\)]*\)", repl, cypher, flags=re.IGNORECASE)
-    cypher = re.sub(r"toLower\(k\.uri\)\s*CONTAINS\s*'_[0-9]{4}'", "FALSE", cypher, flags=re.IGNORECASE)
+    pat1 = re.compile(r"(p\.uri\s*ENDS\s*WITH\s*'#(\d{4})')", re.IGNORECASE)
+    cypher = pat1.sub(lambda m: f"({m.group(1)} OR p.uri ENDS WITH '/{m.group(2)}' OR toLower(k.uri) CONTAINS '_{m.group(2)}')", cypher)
     return cypher
 
 def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
@@ -325,7 +258,7 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     fixed = cypher.strip()
     fixed = remove_generic_labels(fixed)
     for prop in ["KennzahlWert", "anteilProzent"]:
-        pattern = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*)\." + re.escape(prop) + r"(?!\s*\[")
+        pattern = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*)\." + re.escape(prop) + r"(?!\s*\[)")
         fixed = pattern.sub(r"coalesce(\1." + prop + r"[0], \1." + prop + r")", fixed)
     if not is_company_question(user_question):
         fixed = expand_metric_labels(fixed)
@@ -335,6 +268,45 @@ def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
     fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
     fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
     return fixed
+
+def de_format_number(x: Any) -> str:
+    try:
+        s = f"{float(x):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return s
+    except Exception:
+        return str(x)
+
+def _tail(uri: Optional[str]) -> Optional[str]:
+    return uri.rsplit("/",1)[-1] if uri else None
+
+def short_name(uri: Optional[str]) -> Optional[str]:
+    return prettify_tail(uri) if uri else None
+
+def std_short(std_uri: Optional[str]) -> Optional[str]:
+    if not std_uri: return None
+    s = prettify_tail(std_uri).upper()
+    if "IFRS" in s: return "IFRS"
+    if "HGB" in s: return "HGB"
+    return s
+
+def _norm(s: str) -> str:
+    return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").strip()
+
+METRIC_RE = re.compile(
+    r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
+    re.IGNORECASE
+)
+
+def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
+    m = METRIC_RE.search(q or "")
+    if not m:
+        return None
+    metric_raw = _norm(m.group(1))
+    year = m.group(3)
+    for key, tail in METRIC_ALIASES.items():
+        if _norm(key) in metric_raw:
+            return {"tail": tail, "year": year}
+    return None
 
 # ================= RAG / PDF =================
 
@@ -385,6 +357,7 @@ def _collection_count() -> int:
         return 0
 
 def _download_to_tmp(url: str) -> str:
+    """Lädt eine Datei nach /tmp und gibt den Pfad zurück."""
     if not url:
         raise ValueError("URL fehlt")
     fd, tmp_path = tempfile.mkstemp(prefix="ragpdf_", suffix=".pdf")
@@ -395,6 +368,7 @@ def _download_to_tmp(url: str) -> str:
     return tmp_path
 
 def _query_rag(question: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    """Embedding + BM25 Kombi; erst Embedding-Retrieval, dann BM25-Re-Rank."""
     col = _get_collection()
     q = col.query(query_texts=[question], n_results=top_k*2)
     docs = q.get("documents", [[]])[0]
@@ -507,9 +481,11 @@ def _extract_region_values_from_text(text: str, need_revenue: bool, need_order: 
 def _ensure_rag_ready():
     try:
         count_before = _collection_count()
+        # 1) Lokaler Pfad
         if AUTO_PDF_PATH and os.path.exists(AUTO_PDF_PATH) and count_before == 0:
             n = _ingest_pdf(AUTO_PDF_PATH)
             print(f"[RAG] Lokale PDF indiziert: {AUTO_PDF_PATH} (Chunks: {n})")
+        # 2) Remote URL (z. B. Google Drive "uc?export=download&id=…")
         elif AUTO_PDF_URL and count_before == 0:
             try:
                 tmp_pdf = _download_to_tmp(AUTO_PDF_URL)
@@ -550,6 +526,7 @@ def rag_ingest_pdf(file_path: str):
 
 @app.post("/rag/ingest_pdf_url")
 def rag_ingest_pdf_url(url: str):
+    """Manuelles Ingesten einer Remote-PDF-URL."""
     try:
         tmp_pdf = _download_to_tmp(url)
         n = _ingest_pdf(tmp_pdf)
@@ -605,7 +582,7 @@ def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = ""
             params={"holding": HOLDING_LABELS, "limit": limit},
             tag="list:company",
         )
-        items = [{"uri": r["uri"], "label": prettify_tail(r["uri"]) } for r in rows]
+        items = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in rows]
     else:
         rows = _run_cypher(
             """
@@ -618,7 +595,7 @@ def list_items(kind: str = Query(..., pattern="^(company|metric)$"), q: str = ""
             params={"ml": METRIC_LABELS, "limit": limit},
             tag="list:metric",
         )
-        items = [{"uri": r["uri"], "label": prettify_tail(r["uri"]) } for r in rows]
+        items = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in rows]
     if q:
         ql = q.lower()
         items = [it for it in items if ql in (it["label"] or "").lower()]
@@ -733,43 +710,31 @@ def chat_plus(body: ChatBody):
     cypher_raw = None
     cypher_exec = None
     rows: List[Dict[str, Any]] = []
-    handled = False
 
     # ---- deterministischer Kennzahl+Jahr Pfad (Graph) – vor LLM
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
-            # Tail robust normalisieren (ohne führenden '/', inkl. Umlaut- & Percent-Varianten)
-            tail_raw = my["tail"].lstrip("/")  # z. B. "Umsatzerlöse"
-            tail_slug = _slugify_metric_token(tail_raw)
-            tail_slug_oe = _slug_oe(tail_slug)
-            tail_slug_pct = _percent_encode_utf8(tail_raw)  # %C3%B6 etc.
+            tail = my["tail"]
             year = my["year"]
-
+            # Breiter Kennzahl-Label-Match + Jahr robust über p.uri ODER k.uri (_YYYY)
             cypher_exec = f"""
             MATCH (k)-[:beziehtSichAufPeriode]->(p:Geschaeftsjahr)
             OPTIONAL MATCH (k)-[:hatFinanzkennzahl]->(u:Konzernmutter)
             WHERE ANY(l IN labels(k) WHERE l IN $ml)
               AND (
-                    toLower(k.uri) ENDS WITH toLower('/{tail_slug}')
-                 OR toLower(k.uri) ENDS WITH toLower('{tail_slug}')
-                 OR toLower(k.uri) ENDS WITH toLower('/{tail_slug_oe}')
-                 OR toLower(k.uri) ENDS WITH toLower('{tail_slug_oe}')
-                 OR toLower(k.uri) ENDS WITH toLower('/{tail_slug_pct}')
-                 OR toLower(k.uri) ENDS WITH toLower('{tail_slug_pct}')
-                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug}')
-                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug_oe}')
-                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug_pct}')
+                    toLower(k.uri) ENDS WITH toLower('{tail}')
+                 OR toLower(replace(replace(k.uri,'-','_'),'.','_')) CONTAINS toLower('{tail}')
               )
               AND (
                     p.uri ENDS WITH '#{year}'
                  OR p.uri ENDS WITH '/{year}'
+                 OR toLower(k.uri) CONTAINS '_{year}'
               )
             RETURN k.uri AS uri, coalesce(k.KennzahlWert[0], k.KennzahlWert) AS wert
             ORDER BY toLower(uri)
             LIMIT 50
             """.strip()
-
             try:
                 rows = _run_cypher(
                     cypher_exec,
@@ -779,44 +744,25 @@ def chat_plus(body: ChatBody):
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-            # Mehrtreffer -> Clarify-Auswahl (hart auf Zielmetrik filtern)
+            # Mehrtreffer -> Clarify-Auswahl
             if len(rows) > 1:
-                filtered = [r for r in rows if _uri_contains_metric(r.get("uri", ""), tail_slug)]
-                if filtered:
-                    show = filtered
-                    options = []
-                    for r in show[:20]:
-                        uri = r.get("uri")
-                        if not uri:
-                            continue
-                        options.append({
-                            "uri": uri,
-                            "label": prettify_tail(uri),
-                            "wert": r.get("wert"),
-                            "wert_fmt": (f"{float(r.get('wert')):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".") if r.get("wert") is not None else None),
-                        })
-                    handled = True
-                    print(f"[Clarify][deterministic] options={len(options)} rows_total={len(rows)} metric={tail_slug}")
-                    return {
-                        "mode": "clarify",
-                        "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                        "options": options,
-                        "cypher_tried": cypher_exec,
-                        "row_count": len(rows),
-                    }
-                else:
-                    handled = True
-                    return {
-                        "mode": "answer",
-                        "cypher": "(deterministisch)",
-                        "cypher_executed": cypher_exec,
-                        "rows": rows,
-                        "row_count": len(rows),
-                        "answer": (
-                            "Für 2024 wurden mehrere Kennzahlen gefunden, aber keine passte eindeutig zu 'Umsatzerlöse'. "
-                            "Meinst du Gesamtumsatz, Region (z. B. USA/Deutschland) oder Segment (z. B. Digital Industries)?"
-                        ),
-                    }
+                options = []
+                for r in rows[:20]:
+                    uri = r.get("uri")
+                    if not uri:
+                        continue
+                    options.append({
+                        "uri": uri,
+                        "label": prettify_tail(uri),
+                        "wert": r.get("wert"),
+                    })
+                return {
+                    "mode": "clarify",
+                    "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
+                    "options": options,
+                    "cypher_tried": cypher_exec,
+                    "row_count": len(rows),
+                }
 
             # Single-Hit -> hübsch ausformulieren
             if rows:
@@ -827,17 +773,15 @@ def chat_plus(body: ChatBody):
                         det = value_by_uri(uri)
                         if det["kind"] == "metric":
                             value = det.get("wert")
-                            year_txt = (prettify_tail(det.get("periode") or "") or "").split("#")[-1] or "?"
-                            einheit = prettify_tail(det.get("einheit") or "") or ""
-                            std = (prettify_tail(det.get("standard") or "") or "").upper() or "IFRS/HGB"
-                            val_txt = (f"{float(value):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".") if value is not None else "—")
+                            year_txt = (short_name(det.get("periode")) or "").split("#")[-1] or "?"
+                            einheit = short_name(det.get("einheit")) or ""
+                            std = std_short(det.get("standard")) or "IFRS/HGB"
+                            val_txt = de_format_number(value)
                             label = det["label"]
                             text = (
                                 f'Die Kennzahl "{label}" wird nach {std} ermittelt und '
                                 f'belief sich im Geschäftsjahr {year_txt} auf {val_txt} {einheit}.'
                             )
-                            handled = True
-                            print("[Answer][deterministic] pretty metric answer")
                             return {
                                 "mode": "answer",
                                 "cypher": "(deterministisch)",
@@ -851,22 +795,18 @@ def chat_plus(body: ChatBody):
 
                 # Fallback: Wert-only
                 if "wert" in r0 and r0["wert"] is not None:
-                    handled = True
-                    print("[Answer][deterministic] value-only fallback")
-                    val_txt = f"{float(r0['wert']):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
                     return {
                         "mode": "answer",
                         "cypher": "(deterministisch)",
                         "cypher_executed": cypher_exec,
                         "rows": rows,
                         "row_count": len(rows),
-                        "answer": f"Ergebnis: {val_txt}",
+                        "answer": f"Ergebnis: {de_format_number(r0['wert'])}",
                     }
+    # wenn keine Rows -> normal weiter (LLM)
 
-    print(f"[Flow] after deterministic: handled={handled}, rows={len(rows) if rows is not None else 'None'}")
-
-    # -------- Graph (LLM-Cypher), wenn nicht "pdf only" UND noch nicht handled
-    if not force_pdf and not handled:
+    # -------- Graph (LLM-Cypher), wenn nicht "pdf only"
+    if not force_pdf:
         cypher_in = cypher_prompt.format(
             history=history_text or "(kein Verlauf)",
             schema=schema_text,
@@ -882,136 +822,106 @@ def chat_plus(body: ChatBody):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-        # Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
-        if not force_pdf:
-            # Disambiguation: Firmen
-            if (len(rows) > 1 or (not rows and is_company_question(question))):
-                if is_company_question(question):
-                    cq = """
-                    MATCH (n)
-                    WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
-                    WITH n, toLower(n.uri) AS u
-                    WHERE u CONTAINS toLower($needle)
-                    OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
-                    RETURN n.uri AS uri, m.uri AS konzern
-                    ORDER BY uri
-                    LIMIT 8
-                    """
-                    cands = _run_cypher(cq, params={"holding": HOLDING_LABELS, "needle": question}, tag="disambiguation")
-                    if cands:
-                        options = [{"uri": r["uri"], "label": prettify_tail(r["uri"]) } for r in cands]
-                        return {
-                            "mode": "clarify",
-                            "question": "Ich habe mehrere passende Unternehmen gefunden. Welches meinst du?",
-                            "options": options,
-                            "cypher_tried": cypher_exec
-                        }
-
-            # Kennzahlen-Disambiguation (eingrenzen, falls Frage eine Zielkennzahl nennt)
-            if len(rows) > 1 and not is_company_question(question):
-                ql = (question or "").lower()
-                want_umsa = ("umsatzerlöse" in ql) or ("umsatzerloese" in ql)
-                want_oi   = ("auftragseingang" in ql)
-
-                show_rows = rows
-                if want_umsa:
-                    show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "umsatzerlöse")]
-                elif want_oi:
-                    show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "auftragseingang")]
-
-                if not show_rows:
-                    # Lieber keine falschen Optionen anzeigen
-                    return {
-                        "mode": "answer",
-                        "cypher": cypher_raw,
-                        "cypher_executed": cypher_exec,
-                        "rows": rows,
-                        "row_count": len(rows),
-                        "answer": (
-                            "Mehrere Kennzahlen gefunden, aber keine, die eindeutig zur gewünschten Kategorie passt. "
-                            "Bitte präzisiere: Gesamt, Region oder Segment?"
-                        )
-                    }
-
-                opts = []
-                for r in show_rows[:20]:
-                    uri = r.get("uri")
-                    if uri:
-                        opts.append({
-                            "uri": uri,
-                            "label": prettify_tail(uri),
-                            "wert": r.get("wert"),
-                            "wert_fmt": (f"{float(r.get('wert')):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".") if r.get("wert") is not None else None),
-                        })
-                if opts:
+    # ---- Disambiguation & formatierte Antworten nur, wenn Graph benutzt wird
+    if not force_pdf:
+        # Disambiguation: Firmen
+        if (len(rows) > 1 or (not rows and is_company_question(question))):
+            if is_company_question(question):
+                cq = """
+                MATCH (n)
+                WHERE ( 'Konzernmutter' IN labels(n) ) OR ANY(l IN labels(n) WHERE l IN $holding)
+                WITH n, toLower(n.uri) AS u
+                WHERE u CONTAINS toLower($needle)
+                OPTIONAL MATCH (n)-[:istTochterVon|hatKonzernmutter]->(m:Konzernmutter)
+                RETURN n.uri AS uri, m.uri AS konzern
+                ORDER BY uri
+                LIMIT 8
+                """
+                cands = _run_cypher(cq, params={"holding": HOLDING_LABELS, "needle": question}, tag="disambiguation")
+                if cands:
+                    options = [{"uri": r["uri"], "label": prettify_tail(r["uri"])} for r in cands]
                     return {
                         "mode": "clarify",
-                        "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
-                        "options": opts,
+                        "question": "Ich habe mehrere passende Unternehmen gefunden. Welches meinst du?",
+                        "options": options,
                         "cypher_tried": cypher_exec
                     }
 
-            # Formatierte Antworten
-            if rows:
-                r0 = rows[0]
-                uri = r0.get("uri")
+        # Kennzahlen-Disambiguation
+        if len(rows) > 1 and not is_company_question(question):
+            opts = []
+            for r in rows[:20]:
+                uri = r.get("uri")
                 if uri:
-                    try:
-                        det = value_by_uri(uri)
-                        if det["kind"] == "company":
-                            anteil = det.get("wert")
-                            anteil_txt = (f"{float(anteil):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " %") if anteil is not None else "100 %"
-                            konzern_txt = prettify_tail(det.get("konzern") or "") or "die Konzernmutter"
-                            sitz = ""
-                            if det.get("stadt") or det.get("land"):
-                                city = prettify_tail(det.get("stadt") or "") or "?"
-                                country = prettify_tail(det.get("land") or "") or "?"
-                                sitz = f"\nSitz: {city}, {country}"
-                            kommentar = det.get("kommentar")
-                            kmt = f"\nKommentar: {kommentar}" if kommentar else ""
-                            text = f"Die {konzern_txt} hält {anteil_txt} an {det['label']}.{sitz}{kmt}"
-                            return {
-                                "mode": "answer",
-                                "cypher": cypher_raw,
-                                "cypher_executed": cypher_exec,
-                                "rows": rows,
-                                "row_count": len(rows),
-                                "answer": text
-                            }
-                        elif det["kind"] == "metric":
-                            value = det.get("wert")
-                            year = prettify_tail(det.get("periode") or "")
-                            year = year.split("#")[-1] if year else "?"
-                            einheit = prettify_tail(det.get("einheit") or "") or ""
-                            std = (prettify_tail(det.get("standard") or "") or "").upper() or "IFRS/HGB"
-                            val_txt = (f"{float(value):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".") if value is not None else "—")
-                            label = det["label"]
-                            text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year} auf {val_txt} {einheit}.'
-                            return {
-                                "mode": "answer",
-                                "cypher": cypher_raw,
-                                "cypher_executed": cypher_exec,
-                                "rows": rows,
-                                "row_count": len(rows),
-                                "answer": text
-                            }
-                    except Exception:
-                        pass
+                    opts.append({"uri": uri, "label": prettify_tail(uri), "wert": r.get("wert")})
+            if opts:
+                return {
+                    "mode": "clarify",
+                    "question": "Ich habe mehrere passende Kennzahlen gefunden. Welche meinst du genau?",
+                    "options": opts,
+                    "cypher_tried": cypher_exec
+                }
 
-                # Fallback: Wert-only
-                if "wert" in r0 and r0["wert"] is not None:
-                    val_txt = f"{float(r0['wert']):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                    return {
-                        "mode": "answer",
-                        "cypher": cypher_raw,
-                        "cypher_executed": cypher_exec,
-                        "rows": rows,
-                        "row_count": len(rows),
-                        "answer": f"Ergebnis: {val_txt}"
-                    }
+        # Formatierte Antworten
+        if rows:
+            r0 = rows[0]
+            uri = r0.get("uri")
+            if uri:
+                try:
+                    det = value_by_uri(uri)
+                    if det["kind"] == "company":
+                        anteil = det.get("wert")
+                        anteil_txt = f"{de_format_number(anteil)} %" if anteil is not None else "100 %"
+                        konzern_txt = short_name(det.get("konzern")) or "die Konzernmutter"
+                        sitz = ""
+                        if det.get("stadt") or det.get("land"):
+                            city = short_name(det.get("stadt")) or "?"
+                            country = short_name(det.get("land")) or "?"
+                            sitz = f"\nSitz: {city}, {country}"
+                        kommentar = det.get("kommentar")
+                        kmt = f"\nKommentar: {kommentar}" if kommentar else ""
+                        text = f"Die {konzern_txt} hält {anteil_txt} an {det['label']}.{sitz}{kmt}"
+                        return {
+                            "mode": "answer",
+                            "cypher": cypher_raw,
+                            "cypher_executed": cypher_exec,
+                            "rows": rows,
+                            "row_count": len(rows),
+                            "answer": text
+                        }
+                    elif det["kind"] == "metric":
+                        value = det.get("wert")
+                        year = short_name(det.get("periode"))
+                        year = year.split("#")[-1] if year else "?"
+                        einheit = short_name(det.get("einheit")) or ""
+                        std = std_short(det.get("standard")) or "IFRS/HGB"
+                        val_txt = de_format_number(value)
+                        label = det["label"]
+                        text = f'Die Kennzahl "{label}" wird nach {std} ermittelt und belief sich im Geschäftsjahr {year} auf {val_txt} {einheit}.'
+                        return {
+                            "mode": "answer",
+                            "cypher": cypher_raw,
+                            "cypher_executed": cypher_exec,
+                            "rows": rows,
+                            "row_count": len(rows),
+                            "answer": text
+                        }
+                except Exception:
+                    pass
+
+            # Fallback: Wert-only
+            if "wert" in r0 and r0["wert"] is not None:
+                return {
+                    "mode": "answer",
+                    "cypher": cypher_raw,
+                    "cypher_executed": cypher_exec,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "answer": f"Ergebnis: {de_format_number(r0['wert'])}"
+                }
 
     # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
-    should_use_rag = force_pdf or (not rows and not force_graph)  # auf RAG zurückfallen, wenn Graph leer
+    should_use_rag = force_pdf or (not rows and not force_graph)
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
@@ -1054,6 +964,7 @@ def chat_plus(body: ChatBody):
                         "pdf_source": source_name or "PDF"
                     }
 
+                # keine eindeutigen Zahlen → defensiv
                 sources = { (c.get("meta") or {}).get("source") for c in ctx if (c.get("meta") or {}).get("source") }
                 source_name = ", ".join(sorted(sources)) if sources else None
                 return {
