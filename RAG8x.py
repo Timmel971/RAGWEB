@@ -786,7 +786,7 @@ def chat_plus(body: ChatBody):
         # Kennzahlen-Disambiguation
         if len(rows) > 1 and not is_company_question(question):
             opts = []
-            for r in rows[:8]:
+            for r in rows[:20]:
                 uri = r.get("uri")
                 if uri:
                     opts.append({"uri": uri, "label": prettify_tail(uri), "wert": r.get("wert")})
