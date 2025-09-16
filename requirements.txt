@@ -1,7 +1,6 @@
 fastapi==0.116.1
 uvicorn==0.35.0
 python-dotenv==1.0.1
-requests==2.32.5
 
 langchain-openai==0.2.6
 langchain-community==0.3.7
@@ -13,7 +12,4 @@ rank-bm25==0.2.2
 PyMuPDF==1.24.14
 
 neo4j==5.28.2
-pandas==2.3.2
-numpy==1.26.4
-PyPDF2==3.0.1
-pycryptodome==3.23.0
+pydantic>=2.7,<3
