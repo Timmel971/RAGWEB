@@ -192,7 +192,15 @@ def prettify_tail(uri: str) -> str:
     return re.sub(r"\s+", " ", tail.replace("_"," ").replace("%20"," ")).strip()
 
 def is_company_question(text: str) -> bool:
-    t = " " + text.lower() + " "
+    t = " " + (text or "").lower() + " "
+
+    # harte Ausschlüsse: Segmente/Bereiche sind KEINE Firmen
+    segment_hints = [" segment", " geschaeftsbereich", " geschäftsbereich",
+                     " digital industries", " smart infrastructure",
+                     " mobility", " siemens healthineers"]
+    if any(h in t for h in segment_hints):
+        return False
+
     if "tochter" in t or "beteilig" in t:
         return True
     COMPANY_HINTS = [
@@ -212,7 +220,7 @@ def expand_holdings(cypher: str) -> str:
     cypher = cypher.replace("[:istTochterVon]", "[:istTochterVon|hatKonzernmutter]")
     cypher = cypher.replace("[:hatKonzernmutter]", "[:istTochterVon|hatKonzernmutter]")
     return cypher
-    
+
 def expand_metric_labels(cypher: str) -> str:
     # Ersetze jedes einzelne Kennzahl-Label durch die Union aller vier
     union = ":Periodenkennzahl|Erfolgskennzahl|Bestandskennzahl|Nachhaltigkeitskennzahl"
@@ -249,26 +257,6 @@ def expand_year_filters(cypher: str) -> str:
     cypher = pat1.sub(lambda m: f"({m.group(1)} OR p.uri ENDS WITH '/{m.group(2)}' OR toLower(k.uri) CONTAINS '_{m.group(2)}')", cypher)
     return cypher
 
-def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
-    lowered = " " + cypher.lower().replace("\n", " ") + " "
-    if any(kw in lowered for kw in [" create "," merge "," delete "," remove "," set ",
-                                    " call dbms", " apoc.trigger", " apoc.schema", " load csv",
-                                    " create constraint", " drop constraint", " create index", " drop index"]):
-        raise HTTPException(status_code=400, detail="Nur Leseabfragen sind erlaubt.")
-    fixed = cypher.strip()
-    fixed = remove_generic_labels(fixed)
-    for prop in ["KennzahlWert", "anteilProzent"]:
-        pattern = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*)\." + re.escape(prop) + r"(?!\s*\[)")
-        fixed = pattern.sub(r"coalesce(\1." + prop + r"[0], \1." + prop + r")", fixed)
-    if not is_company_question(user_question):
-        fixed = expand_metric_labels(fixed)
-    fixed = expand_holdings(fixed)
-    fixed = expand_uri_endswiths(fixed)
-    fixed = expand_year_filters(fixed)
-    fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
-    fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
-    return fixed
-
 def de_format_number(x: Any) -> str:
     try:
         s = f"{float(x):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -292,6 +280,19 @@ def std_short(std_uri: Optional[str]) -> Optional[str]:
 def _norm(s: str) -> str:
     return s.lower().replace("ä","ae").replace("ö","oe").replace("ü","ue").strip()
 
+def _slugify_metric_token(s: str) -> str:
+    return (s or "").strip().replace(" ", "_")
+
+def _slug_oe(s: str) -> str:
+    return (s or "").replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")
+
+def _uri_contains_metric(uri: str, metric_slug: str) -> bool:
+    if not uri:
+        return False
+    u = uri.lower()
+    ms = (metric_slug or "").lower()
+    return (ms in u) or (_slug_oe(ms) in u)
+
 METRIC_RE = re.compile(
     r"\b(umsatzerl(ö|oe)se|umsatz|auftragseingang)\b.*?(20\d{2})",
     re.IGNORECASE
@@ -307,6 +308,26 @@ def parse_metric_year_question(q: str) -> Optional[Dict[str, Any]]:
         if _norm(key) in metric_raw:
             return {"tail": tail, "year": year}
     return None
+
+def sanitize_and_fix(cypher: str, user_question: str = "") -> str:
+    lowered = " " + cypher.lower().replace("\n", " ") + " "
+    if any(kw in lowered for kw in [" create "," merge "," delete "," remove "," set ",
+                                    " call dbms", " apoc.trigger", " apoc.schema", " load csv",
+                                    " create constraint", " drop constraint", " create index", " drop index"]):
+        raise HTTPException(status_code=400, detail="Nur Leseabfragen sind erlaubt.")
+    fixed = cypher.strip()
+    fixed = remove_generic_labels(fixed)
+    for prop in ["KennzahlWert", "anteilProzent"]:
+        pattern = re.compile(r"(\b[A-Za-z_][A-Za-z0-9_]*)\." + re.escape(prop) + r"(?!\s*\[)")
+        fixed = pattern.sub(r"coalesce(\1." + prop + r"[0], \1." + prop + r")", fixed)
+    if not is_company_question(user_question):
+        fixed = expand_metric_labels(fixed)
+    fixed = expand_holdings(fixed)
+    fixed = expand_uri_endswiths(fixed)
+    fixed = expand_year_filters(fixed)
+    fixed = re.sub(r"\bAS\s+anteil\b", "AS wert", fixed, flags=re.IGNORECASE)
+    fixed = re.sub(r"\bAS\s+(value|betrag|amount)\b", "AS wert", fixed, flags=re.IGNORECASE)
+    return fixed
 
 # ================= RAG / PDF =================
 
@@ -715,10 +736,11 @@ def chat_plus(body: ChatBody):
     if not force_pdf:
         my = parse_metric_year_question(question)
         if my:
-            # Tail robust normalisieren (ohne führenden '/', als Slug für CONTAINS)
-            tail_raw = my["tail"]                  # z. B. "/Umsatzerlöse"
-            tail_norm = tail_raw.lstrip("/")       # "Umsatzerlöse"
-            tail_slug = tail_norm.replace(" ", "_")  # "Umsatzerlöse" -> "Umsatzerlöse" (evtl. mit _)
+            # Tail robust normalisieren (ohne führenden '/', mit Umlaut-Variante)
+            tail_raw = my["tail"]                   # z. B. "/Umsatzerlöse"
+            tail_norm = tail_raw.lstrip("/")        # "Umsatzerlöse"
+            tail_slug = _slugify_metric_token(tail_norm)    # "Umsatzerlöse" -> "Umsatzerlöse"
+            tail_slug_oe = _slug_oe(tail_slug)              # "Umsatzerlöse" -> "Umsatzerloese"
             year = my["year"]
 
             cypher_exec = f"""
@@ -729,6 +751,7 @@ def chat_plus(body: ChatBody):
                     toLower(k.uri) ENDS WITH toLower('/{tail_slug}')
                  OR toLower(k.uri) ENDS WITH toLower('{tail_slug}')
                  OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug}')
+                 OR toLower(replace(replace(replace(k.uri,'-','_'),'.','_'),'/','_')) CONTAINS toLower('{tail_slug_oe}')
               )
               AND (
                     p.uri ENDS WITH '#{year}'
@@ -748,10 +771,12 @@ def chat_plus(body: ChatBody):
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Cypher-Ausführung fehlgeschlagen: {e}")
 
-            # Mehrtreffer -> Clarify-Auswahl
+            # Mehrtreffer -> Clarify-Auswahl (hart auf Umsatzerlöse filtern)
             if len(rows) > 1:
+                filtered = [r for r in rows if _uri_contains_metric(r.get("uri",""), tail_slug)]
+                show = filtered if filtered else rows
                 options = []
-                for r in rows[:20]:
+                for r in show[:20]:
                     uri = r.get("uri")
                     if not uri:
                         continue
@@ -852,13 +877,31 @@ def chat_plus(body: ChatBody):
                         "cypher_tried": cypher_exec
                     }
 
-        # Kennzahlen-Disambiguation
-        if len(rows) > 1 and not is_company_question(question):
+        # Kennzahlen-Disambiguation (eingrenzen, falls Frage eine Zielkennzahl nennt)
+        if len(rows) > 1 and not is_company_question(question)):
+            ql = (question or "").lower()
+            want_umsa = ("umsatzerlöse" in ql) or ("umsatzerloese" in ql)
+            want_oi   = ("auftragseingang" in ql)
+
+            show_rows = rows
+            if want_umsa:
+                show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "umsatzerlöse")]
+            elif want_oi:
+                show_rows = [r for r in rows if _uri_contains_metric(r.get("uri",""), "auftragseingang")]
+
+            if not show_rows:
+                show_rows = rows
+
             opts = []
-            for r in rows[:20]:
+            for r in show_rows[:20]:
                 uri = r.get("uri")
                 if uri:
-                    opts.append({"uri": uri, "label": prettify_tail(uri), "wert": r.get("wert")})
+                    opts.append({
+                        "uri": uri,
+                        "label": prettify_tail(uri),
+                        "wert": r.get("wert"),
+                        "wert_fmt": de_format_number(r.get("wert")) if r.get("wert") is not None else None,
+                    })
             if opts:
                 return {
                     "mode": "clarify",
@@ -926,7 +969,7 @@ def chat_plus(body: ChatBody):
                 }
 
     # ---- RAG (PDF) – wenn explizit (force_pdf) oder als Fallback
-    should_use_rag = force_pdf or (not rows and not force_graph)  # <- immer auf RAG zurückfallen, wenn Graph leer
+    should_use_rag = force_pdf or (not rows and not force_graph)  # immer auf RAG zurückfallen, wenn Graph leer
     if should_use_rag:
         ctx = _query_rag(question, top_k=8)
         if ctx:
